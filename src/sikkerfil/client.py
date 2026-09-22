@@ -210,21 +210,64 @@ class Sikkerfil:
         """
         return self._resolve(parse_link(link))[0]
 
-    def receive(self, link: str, *, password: str | None = None) -> ReceivedFile:
+    def receive(
+        self,
+        link: str,
+        *,
+        password: str | None = None,
+        key: str | None = None,
+    ) -> ReceivedFile:
         """Download and decrypt.
 
-        The key comes out of the link's ``#k=`` fragment and is used locally; it
-        is never part of any request this makes.
+        TWO WAYS IN, because there are two situations.
+
+        A RECIPIENT holds a link and nothing else, so the whole link works::
+
+            sf.receive("https://sikkerfil.no/s/ABCD1234#k=...")
+
+        A SENDER who kept the share usually has the id and the key as separate
+        columns — :class:`SentShare` hands them over separately, so storing them
+        that way is the obvious thing to do. Pass them separately::
+
+            sf.receive(sent.id, key=sent.key)
+
+        THE DOMAIN IN A LINK IS NOT ROUTING. One distribution serves
+        sikkerfil.no, sakerfil.se and sikkerfil.dk from one table, and Host is
+        not in its cache key, so any market answers for any share. Which front
+        door this client uses is set by ``market``/``base_url``; the link only
+        ever has to supply the id (or name) and, if you have not kept it, the
+        key. There is nothing in a full URL that this client does not already
+        know.
+
+        The key is used in this process and is never part of any request.
         """
         parsed = parse_link(link)
-        if not parsed.key:
+
+        # BOTH, AND DISAGREEING, is not something to resolve by precedence. One
+        # of them opens the file and the other does not, and picking silently
+        # means the caller debugs a decryption failure rather than a typo.
+        if key and parsed.key and key.strip() != parsed.key:
             raise ConfigurationError(
-                "this link has no key. The part after '#k=' is what decrypts the "
-                "file, and without it the bytes cannot be opened by anyone — "
-                "including us. Ask the sender for the complete link."
+                "two different keys: one in the link's '#k=' fragment and one in "
+                "key=. Pass the link on its own, or the id with key=, but not a "
+                "link whose fragment contradicts the argument."
             )
+
+        secret = (key or parsed.key or "").strip()
+        if not secret:
+            raise ConfigurationError(
+                f"no decryption key for {parsed.reference or link!r}. The key is "
+                "the part after '#k=' in the share link, and without it the bytes "
+                "cannot be opened by anyone — including us.\n"
+                "  - Recipient: ask the sender for the whole link, fragment and "
+                "all. Quote it in a shell, or the '#' starts a comment and the "
+                "key is dropped before the program starts.\n"
+                "  - Sender: if you kept the id and key separately, pass them "
+                "that way — receive(share_id, key=...)."
+            )
+
         share, _ = self._resolve(parsed)
-        return self._fetch(share, parsed.key, password)
+        return self._fetch(share, secret, password)
 
     # --- Housekeeping --------------------------------------------------------
 
@@ -334,6 +377,8 @@ def receive(
     link: str,
     *,
     password: str | None = None,
+    key: str | None = None,
+    market: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> ReceivedFile:
     """Download and decrypt a share, with no account and no configuration.
@@ -343,16 +388,34 @@ def receive(
         import sikkerfil
         file = sikkerfil.receive("https://sikkerfil.no/s/ABCD1234#k=...")
         file.save("~/Downloads")
+
+    Or from an id and a key kept separately, which is how a sender who stored
+    the share will have them::
+
+        sikkerfil.receive("ABCD1234", key="...")
+
+    ``market`` picks the front door when the link does not name one ("no",
+    "se", "dk"). It rarely matters: one distribution serves all three from one
+    table, so any of them answers for any share.
     """
-    return _client_for(link, timeout).receive(link, password=password)
+    return _client_for(link, timeout, market).receive(link, password=password, key=key)
 
 
-def inspect(link: str, *, timeout: float = DEFAULT_TIMEOUT) -> Share:
-    """Metadata for a share, without downloading it. No account needed."""
-    return _client_for(link, timeout).inspect(link)
+def inspect(
+    link: str,
+    *,
+    market: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Share:
+    """Metadata for a share, without downloading it. No account, no key needed.
+
+    Takes a link or a bare id — the metadata is public to anyone holding the id,
+    which is why the key is not a parameter here at all.
+    """
+    return _client_for(link, timeout, market).inspect(link)
 
 
-def _client_for(link: str, timeout: float) -> Sikkerfil:
+def _client_for(link: str, timeout: float, market: str | None = None) -> Sikkerfil:
     """Build a client for whichever market the link points at.
 
     AN EXPLICIT BASE URL STILL WINS. Following the link is the right default —
@@ -364,6 +427,8 @@ def _client_for(link: str, timeout: float) -> Sikkerfil:
     """
     if os.environ.get(ENV_BASE_URL):
         return Sikkerfil(timeout=timeout)
+    if market:
+        return Sikkerfil(market=market, timeout=timeout)
     origin = parse_link(link).origin
     if origin:
         return Sikkerfil(base_url=origin, timeout=timeout)
