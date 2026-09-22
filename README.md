@@ -47,6 +47,33 @@ file.save("~/Downloads")               # -> ~/Downloads/kvartalsrapport.pdf
 The filename is sealed under the same key as the file, so it comes back
 decrypted locally — the service never held it in the clear.
 
+### The link is a convenience, not a requirement
+
+A recipient has a link, so the link works. But if you sent the file and kept it,
+you probably have the id and the key in two columns — `SentShare` hands them
+over separately. Pass them that way:
+
+```python
+sikkerfil.receive(sent.id, key=sent.key)
+```
+
+That is also the way back from a shell that ate the fragment: an unquoted `#`
+starts a comment, so the key is gone before the program starts.
+
+**The domain in a link is not routing.** One distribution serves `sikkerfil.no`,
+`sakerfil.se` and `sikkerfil.dk` from one table, and the Host header is not in
+its cache key, so any market answers for any share. Which front door gets dialled
+is a property of your client, not of the link:
+
+```python
+sikkerfil.receive("ABCD1234", key="...", market="dk")
+Sikkerfil(market="dk").receive("ABCD1234", key="...")
+```
+
+Giving a key in both the fragment and `key=` is refused rather than resolved by
+precedence — one of them opens the file and the other does not, and guessing
+turns a typo into a decryption failure.
+
 ## Command line
 
 ```bash

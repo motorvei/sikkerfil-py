@@ -242,7 +242,7 @@ def test_a_link_without_a_key_is_refused_before_the_download(
     sent = client.send(PLAINTEXT)
     bare = sent.url.split("#")[0]
     before = len(stub.requests)
-    with pytest.raises(ConfigurationError, match="no key"):
+    with pytest.raises(ConfigurationError, match="no decryption key"):
         client.receive(bare)
     assert len(stub.requests) == before, "a hopeless download was attempted anyway"
 
