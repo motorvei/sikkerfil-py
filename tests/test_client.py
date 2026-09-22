@@ -275,7 +275,12 @@ def test_listing_and_audit(client: Sikkerfil, stub) -> None:
     events = client.audit(sent)
     assert [e.action for e in events] == ["created", "downloaded"]
     assert events[1].country == "NO"
-    assert "share,action" in client.audit_csv(sent)
+    # The format the SERVICE emits (toCsv in app/src/http.ts), not one the stub
+    # made up: ISO timestamps rather than epoch seconds, and CRLF per RFC 4180.
+    csv = client.audit_csv(sent)
+    assert csv.startswith("share_id,timestamp_utc,action,country\r\n"), csv[:80]
+    assert "2023-11-14T22:13:20.000Z" in csv, "timestamps are not ISO 8601"
+    assert csv.endswith("\r\n")
 
 
 def test_health(client: Sikkerfil) -> None:

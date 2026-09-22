@@ -20,6 +20,7 @@ import json
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -139,15 +140,28 @@ class StubService:
 
         if method == "GET" and path.endswith("/audit"):
             share_id = path.split("/")[3]
-            return _json(200, {"id": share_id, "events": [
-                {"shareId": share_id, "action": "created", "at": 1_700_000_000},
-                {"shareId": share_id, "action": "downloaded", "at": 1_700_000_100, "country": "NO"},
-            ]})
+            return _json(200, {"id": share_id, "events": _audit_events(share_id)})
 
         if method == "GET" and path.endswith("/audit.csv"):
+            # BYTE-FOR-BYTE THE SERVICE'S toCsv (app/src/http.ts): the header is
+            # share_id,timestamp_utc,action,country; timestamps are ISO 8601 with
+            # milliseconds, not epoch seconds; the line ending is CRLF, which RFC
+            # 4180 specifies and Excel on Windows expects.
+            #
+            # This stub used to invent its own header and epoch timestamps, and
+            # that invention got copied into the README as though it were the real
+            # format. A stub that does not match production licenses false
+            # documentation, so both representations are now rendered from one
+            # list of events, exactly as the service does.
+            share_id = path.split("/")[3]
+            header = "share_id,timestamp_utc,action,country"
+            rows = [
+                f"{share_id},{_iso(e['at'])},{e['action']},{e.get('country', '')}"
+                for e in _audit_events(share_id)
+            ]
             return Scripted(
                 status=200,
-                body=b"share,action,at,country\nABCD1234,created,1700000000,\n",
+                body=("\r\n".join([header, *rows]) + "\r\n").encode(),
                 headers={"content-type": "text/csv; charset=utf-8"},
             )
 
@@ -199,6 +213,23 @@ class StubService:
             "expiresAt": share["expiresAt"],
             **({"name": share["name"]} if share["name"] else {}),
         })
+
+
+def _audit_events(share_id: str) -> list[dict[str, Any]]:
+    """One source for both representations, as the service has."""
+    return [
+        {"shareId": share_id, "action": "created", "at": 1_700_000_000},
+        {"shareId": share_id, "action": "downloaded", "at": 1_700_000_100, "country": "NO"},
+    ]
+
+
+def _iso(epoch: int) -> str:
+    """JavaScript's Date.toISOString(): milliseconds and a Z, which is what the
+    service writes into the CSV."""
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        + "Z"
+    )
 
 
 def _public(share: dict[str, Any]) -> dict[str, Any]:
