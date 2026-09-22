@@ -15,11 +15,11 @@ an API key and :func:`receive` needs nothing at all.
 
 WHAT AN API KEY CAN AND CANNOT DO, because it surprises people:
 
-    POST /api/shares          key, or a browser session      -> send
-    GET  /api/account/shares  key, or a browser session      -> list your shares
-    DELETE /api/shares/<id>   the WRITE TOKEN, or a session  -> revoke
-    GET  /api/shares/<id>/audit   the WRITE TOKEN, or a session
-    GET/POST/DELETE /api/keys     a session ONLY — a key is refused
+    POST /api/v1/shares          key, or a browser session      -> send
+    GET  /api/v1/account/shares  key, or a browser session      -> list shares
+    DELETE /api/v1/shares/<id>   the WRITE TOKEN, or a session  -> revoke
+    GET  /api/v1/shares/<id>/audit   the WRITE TOKEN, or a session
+    GET/POST/DELETE /api/v1/keys     a session ONLY — a key is refused
 
 The last line is the security posture rather than an oversight: a leaked key can
 do what the account can do with files, and cannot extend its own life, mint a
@@ -53,7 +53,7 @@ from .links import (
     parse_link,
 )
 from .models import AuditEvent, ReceivedFile, SentShare, Share
-from .transport import DEFAULT_TIMEOUT, KEY_HEADER, TOKEN_HEADER, Transport
+from .transport import API_PREFIX, DEFAULT_TIMEOUT, KEY_HEADER, TOKEN_HEADER, Transport
 
 #: Accepted sources for a send: a path, raw bytes, or an open binary file.
 Source = Union[str, "os.PathLike[str]", bytes, bytearray, IO[bytes]]
@@ -171,7 +171,7 @@ class Sikkerfil:
         if self.base_url in MARKETS.values():
             body["origin"] = self.base_url
 
-        created = self._http.post_json("/api/shares", body, headers=key_headers)
+        created = self._http.post_json(f"{API_PREFIX}/shares", body, headers=key_headers)
 
         self._http.put_bytes(
             created["uploadUrl"],
@@ -184,7 +184,7 @@ class Sikkerfil:
 
         write_token = created["writeToken"]
         self._http.post_json(
-            f"/api/shares/{created['id']}/complete",
+            f"{API_PREFIX}/shares/{created['id']}/complete",
             {},
             headers={TOKEN_HEADER: write_token},
         )
@@ -230,7 +230,7 @@ class Sikkerfil:
 
     def shares(self) -> list[Share]:
         """Every share this account has sent that has not expired."""
-        data = self._http.get_json("/api/account/shares", headers=self._key_headers())
+        data = self._http.get_json(f"{API_PREFIX}/account/shares", headers=self._key_headers())
         return [Share.from_json(row) for row in data.get("shares", [])]
 
     def revoke(self, share: str | SentShare, *, write_token: str | None = None) -> None:
@@ -240,7 +240,7 @@ class Sikkerfil:
         the token comes with it; pass an id and supply ``write_token`` yourself.
         """
         share_id, token = _identify(share, write_token)
-        self._http.delete(f"/api/shares/{share_id}", headers={TOKEN_HEADER: token})
+        self._http.delete(f"{API_PREFIX}/shares/{share_id}", headers={TOKEN_HEADER: token})
 
     def audit(self, share: str | SentShare, *, write_token: str | None = None) -> list[AuditEvent]:
         """The trail: created, uploaded, downloaded, revoked, denied.
@@ -251,7 +251,7 @@ class Sikkerfil:
         """
         share_id, token = _identify(share, write_token)
         data = self._http.get_json(
-            f"/api/shares/{share_id}/audit", headers={TOKEN_HEADER: token}
+            f"{API_PREFIX}/shares/{share_id}/audit", headers={TOKEN_HEADER: token}
         )
         return [AuditEvent.from_json(row) for row in data.get("events", [])]
 
@@ -259,7 +259,7 @@ class Sikkerfil:
         """The same trail as CSV, which is the form people actually file."""
         share_id, token = _identify(share, write_token)
         raw = self._http.get_bytes(
-            f"{self.base_url}/api/shares/{share_id}/audit.csv",
+            f"{self.base_url}{API_PREFIX}/shares/{share_id}/audit.csv",
             headers={TOKEN_HEADER: token, "accept": "text/csv"},
         )
         return raw.decode("utf-8")
@@ -267,7 +267,7 @@ class Sikkerfil:
     def health(self) -> bool:
         """Whether the service is answering. No credential, no side effects."""
         try:
-            return bool(self._http.get_json("/api/health").get("ok"))
+            return bool(self._http.get_json(f"{API_PREFIX}/health").get("ok"))
         except ApiError:
             return False
 
@@ -289,9 +289,9 @@ class Sikkerfil:
     def _resolve(self, parsed: ParsedLink) -> tuple[Share, str]:
         """Turn a parsed link into a share and the id to address it by."""
         if parsed.share_id:
-            data = self._http.get_json(f"/api/shares/{parsed.share_id}")
+            data = self._http.get_json(f"{API_PREFIX}/shares/{parsed.share_id}")
         elif parsed.name:
-            data = self._http.get_json(f"/api/navn/{parsed.name}")
+            data = self._http.get_json(f"{API_PREFIX}/navn/{parsed.name}")
         else:  # pragma: no cover - parse_link guarantees one of the two
             raise ConfigurationError("the link names neither a share nor a name")
         share = Share.from_json(data)
@@ -308,7 +308,7 @@ class Sikkerfil:
         key = crypto.b64url_decode(key_text)
         body: dict[str, Any] = {"password": password} if password is not None else {}
         try:
-            granted = self._http.post_json(f"/api/shares/{share.id}/download", body)
+            granted = self._http.post_json(f"{API_PREFIX}/shares/{share.id}/download", body)
         except ApiError as exc:
             raise _download_refusal(exc, share, password is not None) from exc
 

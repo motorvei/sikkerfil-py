@@ -1,6 +1,6 @@
 [project]
 name = "sikkerfil"
-version = "0.1.0"
+version = "0.2.0"
 description = "Client for sikkerfil.no — files encrypted in your process, stored in Stockholm, never readable by the service."
 readme = "README.md"
 # 3.10 AND UP. Python 3.9 reached end of life in October 2025 and no longer

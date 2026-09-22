@@ -19,6 +19,7 @@ import json
 import pytest
 
 from sikkerfil.cli import duration, main
+from sikkerfil.transport import API_PREFIX
 
 
 @pytest.fixture
@@ -159,4 +160,4 @@ def test_an_explicit_base_url_beats_the_links_own_origin(env, capsys) -> None:
     main(["receive", "https://sikkerfil.no/s/NOSUCH01#k=abc"])
     reached = [r.path for r in env.requests]
     assert reached, "the request did not go to the stub — it went somewhere else"
-    assert reached[-1] == "/api/shares/NOSUCH01"
+    assert reached[-1] == f"{API_PREFIX}/shares/NOSUCH01"

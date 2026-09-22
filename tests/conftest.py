@@ -25,6 +25,19 @@ from typing import Any
 
 import pytest
 
+#: Mirrors API_VERSION in the library and API_VERSION in the service's router.
+API_VERSION = "v1"
+API_PREFIX = f"/api/{API_VERSION}"
+
+
+def canonical_path(path: str) -> str:
+    """Map /api/v1/x onto /api/x, exactly as the service's router does."""
+    if path == API_PREFIX:
+        return "/api"
+    if path.startswith(f"{API_PREFIX}/"):
+        return f"/api{path[len(API_PREFIX):]}"
+    return path
+
 
 @dataclass
 class Recorded:
@@ -66,7 +79,13 @@ class StubService:
             scripted, self._scripted = self._scripted, None
             return scripted
 
-        method, path = request.method, request.path
+        # THE SAME NORMALISATION THE REAL SERVICE DOES (canonicalPath in
+        # http.ts): /api/v1/x is dispatched as /api/x, and the bare form still
+        # answers as a legacy alias. Reproduced here so the stub cannot accept
+        # something production would refuse — and so the recorded request still
+        # carries the address the library actually sent, which is what
+        # test_versioning.py asserts on.
+        method, path = request.method, canonical_path(request.path)
 
         if method == "GET" and path == "/api/health":
             return _json(200, {"ok": True})
