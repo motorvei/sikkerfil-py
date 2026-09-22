@@ -140,6 +140,67 @@ name = crypto.open_name(share.encrypted_name, crypto.b64url_decode(key))
 Note that `from sikkerfil import inspect` shadows the standard library's
 `inspect` module. `import sikkerfil` and call `sikkerfil.inspect(...)`.
 
+## Audit a transfer
+
+The trail a data protection officer asks for: what happened to this share, when,
+and roughly from where.
+
+**Needs the write token, not the API key.** Pass the `SentShare` and the token
+comes with it; pass an id and supply it yourself.
+
+```python
+from sikkerfil import Sikkerfil
+
+sf = Sikkerfil()
+
+for event in sf.audit(sent):                     # or: sf.audit(id, write_token="wt_...")
+    where = f" from {event.country}" if event.country else ""
+    print(f"{event.when:%Y-%m-%d %H:%M:%S UTC}  {event.action}{where}")
+```
+
+```
+2026-09-22 10:13:20 UTC  created
+2026-09-22 10:14:02 UTC  uploaded
+2026-09-22 10:15:00 UTC  downloaded from NO
+```
+
+Actions are `created`, `uploaded`, `downloaded`, `revoked` and
+`download_denied`. Each `AuditEvent` carries `share_id`, `action`, `at` (epoch
+seconds, with `.when` as an aware UTC datetime) and `country`.
+
+For the compliance request itself there is a CSV form, which is what somebody
+actually files:
+
+```python
+with open("sikkerfil-ABCD1234.csv", "w", newline="") as handle:
+    handle.write(sf.audit_csv(sent))
+```
+
+`newline=""` is not optional. The service ends every line with CRLF, and Python's
+text mode on Windows translates `\n` to `\r\n` on the way out — turning each
+line ending into `\r\r\n` and corrupting the file for precisely the Excel users
+the CRLF is there for.
+
+```
+share_id,timestamp_utc,action,country
+ABCD1234,2026-09-22T10:13:20.000Z,created,
+ABCD1234,2026-09-22T10:15:00.000Z,downloaded,NO
+```
+
+ISO 8601 timestamps and CRLF line endings, per RFC 4180 — which is what Excel on
+Windows expects, and a DPO opens this in a spreadsheet.
+
+`country` comes from CloudFront's edge rather than from the client, so a
+recipient cannot forge it. It is coarse on purpose: the trail evidences that a
+transfer happened and roughly from where — it is not a location history of
+recipients.
+
+Revoking takes the same credential:
+
+```python
+sf.revoke(sent)                                  # or: sf.revoke(id, write_token="wt_...")
+```
+
 ## Command line
 
 ```bash
