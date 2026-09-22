@@ -9,8 +9,12 @@ record, so the service stores ciphertext it cannot open — in Stockholm
 (`eu-north-1`), operated by a Norwegian company.
 
 ```bash
-pip install sikkerfil        # or: uv add sikkerfil
+pip install git+https://github.com/motorvei/sikkerfil-py
+# or: uv add git+https://github.com/motorvei/sikkerfil-py
 ```
+
+> Not on PyPI yet, so the install is a git URL. `pip install sikkerfil` will
+> work once the name is published; until then it fetches nothing.
 
 ## Send
 
@@ -73,6 +77,68 @@ Sikkerfil(market="dk").receive("ABCD1234", key="...")
 Giving a key in both the fragment and `key=` is refused rather than resolved by
 precedence — one of them opens the file and the other does not, and guessing
 turns a typo into a decryption failure.
+
+## List what you have sent
+
+```python
+from sikkerfil import Sikkerfil
+
+sf = Sikkerfil()                       # reads SIKKERFIL_API_KEY
+
+for share in sf.shares():
+    left = "unlimited" if share.downloads_remaining is None else share.downloads_remaining
+    print(f"{share.id}  {share.size_bytes} B  {left} left  expires {share.expires:%Y-%m-%d}")
+```
+
+```
+TEST0001     37 B  3 left  expires 2026-09-23
+TEST0002     36 B  1 left  expires 2026-09-23
+TEST0003     33 B  5 left  expires 2026-09-29
+```
+
+**A listing cannot get your files back.** `Share` has no `key` attribute and
+`encrypted_name` comes back sealed, because the service never held either — so
+it has nothing to return. A share you kept no key for is permanently unopenable,
+by you and by us. `write_token` is not in the listing either; it is issued once,
+at creation.
+
+So this answers *what is still live and how much is left on it*, not *give me my
+files*. For the latter, keep `sent.id` and `sent.key` when you send, and use
+`receive(id, key=...)`.
+
+## Inspect one share
+
+What the service knows about a share, without downloading or decrypting it.
+Needs no account and **no key** — the id is enough.
+
+```python
+import sikkerfil
+
+share = sikkerfil.inspect("ABCD1234")            # or the whole link, or a name
+
+print(share.size_bytes)                          # ciphertext: 28 B over the original
+print(share.downloads_remaining)                 # None means unlimited
+print(share.password_required)                   # ask before you prompt
+print(share.expires)                             # aware datetime, UTC
+print(share.is_ready)                            # False if the upload never finished
+```
+
+Useful before pulling something large, and before prompting for a password.
+
+The key is deliberately **not** a parameter: metadata is not encrypted, so it
+unlocks nothing here. The one sealed field is the filename, and you open that
+yourself:
+
+```python
+from sikkerfil import crypto
+
+name = crypto.open_name(share.encrypted_name, crypto.b64url_decode(key))
+```
+
+`receive()` does that for you and puts the result on `ReceivedFile.filename`.
+
+Note that `from sikkerfil import inspect` shadows the standard library's
+`inspect` module. `import sikkerfil` and call `sikkerfil.inspect(...)`.
 
 ## Command line
 
