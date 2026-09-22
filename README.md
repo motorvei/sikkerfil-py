@@ -1,2 +1,159 @@
 # sikkerfil-py
-Python library for sikkerfil interactions
+
+Python client for [sikkerfil.no](https://sikkerfil.no) — encrypted file transfer
+that stays inside Scandinavia.
+
+Files are encrypted **in your process**, before anything leaves it. The key
+travels in the URL fragment (`#k=...`), which browsers never send and logs never
+record, so the service stores ciphertext it cannot open — in Stockholm
+(`eu-north-1`), operated by a Norwegian company.
+
+```bash
+pip install sikkerfil        # or: uv add sikkerfil
+```
+
+## Send
+
+Sending needs an API key. Mint one at [sikkerfil.no/konto](https://sikkerfil.no/konto) —
+it needs a Business account.
+
+```python
+from sikkerfil import Sikkerfil
+
+sf = Sikkerfil()                       # reads SIKKERFIL_API_KEY
+sent = sf.send("kvartalsrapport.pdf", max_downloads=2, expires_in=86400)
+
+print(sent.url)                        # give this to the recipient
+print(sent.write_token)                # keep this — see below
+```
+
+`sent.url` contains the decryption key. **Treat it like the file**: anyone who
+has the link can open the contents, and we have never seen the part after `#`.
+
+`sent.write_token` is issued exactly once and cannot be recovered. Revoking the
+share and reading its audit trail both require it — an API key will not do.
+
+## Receive
+
+Receiving needs nothing at all. A recipient holds a link, not an account.
+
+```python
+import sikkerfil
+
+file = sikkerfil.receive("https://sikkerfil.no/s/ABCD1234#k=...")
+file.save("~/Downloads")               # -> ~/Downloads/kvartalsrapport.pdf
+```
+
+The filename is sealed under the same key as the file, so it comes back
+decrypted locally — the service never held it in the clear.
+
+## Command line
+
+```bash
+sikkerfil send rapport.pdf --max-downloads 2 --expires 24h
+sikkerfil receive 'https://sikkerfil.no/s/ABCD1234#k=...' -o ~/Downloads
+
+sikkerfil list
+sikkerfil inspect 'https://sikkerfil.no/s/ABCD1234#k=...'
+sikkerfil audit ABCD1234 --write-token wt_... --csv
+sikkerfil revoke ABCD1234 --write-token wt_...
+```
+
+**Quote the link.** An unquoted `#` starts a comment in every POSIX shell, which
+silently truncates the link to the part before the key. The CLI notices and says
+so, but the shell has already eaten the evidence.
+
+`sikkerfil send` prints the link alone on stdout, so `$(sikkerfil send x.pdf)`
+and `| pbcopy` both do the obvious thing. Everything else goes to stderr.
+
+## Configuration
+
+| Variable | Meaning |
+| --- | --- |
+| `SIKKERFIL_API_KEY` | the key used for sending and listing |
+| `SIKKERFIL_MARKET` | `no`, `se` or `dk` — which front door to use |
+| `SIKKERFIL_BASE_URL` | an explicit origin; overrides the market *and* a link's own origin |
+
+```python
+Sikkerfil(api_key="sikkerfil_sk_...", market="dk", timeout=60, retries=2)
+```
+
+One service, three front doors: `sikkerfil.no`, `sakerfil.se`, `sikkerfil.dk`.
+The market decides which domain your recipients see. The bytes live in Stockholm
+either way.
+
+## What a key can and cannot do
+
+| Endpoint | Credential |
+| --- | --- |
+| send a file | API key, or a browser session |
+| list your shares | API key, or a browser session |
+| revoke a share | the **write token**, or a session |
+| read the audit trail | the **write token**, or a session |
+| download a share | none — the link is the credential |
+| mint, list or revoke API keys | a browser **session only** |
+
+The last row is the security posture rather than an oversight: a leaked key can
+do what the account can do with files, and cannot extend its own life, mint a
+sibling, or hide itself from the list that would reveal it. Revoking it ends it.
+That is also why this library has no key-management functions — they would be
+functions that cannot work.
+
+## Errors
+
+Everything raised is a `SikkerfilError`. The interesting ones lead to genuinely
+different handling:
+
+```python
+from sikkerfil import (
+    PasswordRequiredError,    # 403 on a download — a wrong guess costs no download
+    DownloadsExhaustedError,  # 410 — the sender's limit is spent
+    ShareGoneError,           # expired, revoked, or never finished uploading
+    BudgetError,              # 503 — daily egress budget; .retry_after seconds
+    DecryptionError,          # wrong key, or bytes altered in transit
+    TransportError,           # nothing answered; a retry is reasonable
+)
+```
+
+## How it works
+
+```
+key        = AES-256-GCM, 256 bits, fresh per file
+iv         = 12 random bytes, fresh per file
+object     = iv || ciphertext || tag          # 12 | n | 16 bytes
+fragment   = base64url(raw key)
+```
+
+The envelope is byte-identical to the one the web client produces, and that is
+tested rather than asserted: `tests/test_interop.py` encrypts with the same
+WebCrypto calls the browser makes and decrypts the result here, in both
+directions. A file sent from Python opens in a browser and vice versa.
+
+Two things about the wire are worth knowing if you ever bypass this library:
+
+- **Every POST must carry `x-amz-content-sha256`**, the hex SHA-256 of the body.
+  CloudFront signs each origin request with SigV4, which covers the body; without
+  the digest the request is refused at the edge with
+  `403 InvalidSignatureException` and never reaches the service.
+- **Not `Authorization: Bearer`.** The same mechanism replaces that header in
+  transit, so a credential sent that way arrives as nothing at all. Use
+  `x-sikkerfil-key` and `x-sikkerfil-token`.
+
+Full protocol documentation: [sikkerfil.no/utviklere](https://sikkerfil.no/utviklere)
+
+## Development
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check .
+uv run mypy
+```
+
+The interop tests need Node (for WebCrypto) and skip without it. CI has Node and
+asserts they did not skip — they are the tests that would catch a broken
+envelope before a customer's recipient does.
+
+## Licence
+
+MIT.
