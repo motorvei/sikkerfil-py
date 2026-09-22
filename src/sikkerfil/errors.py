@@ -70,8 +70,8 @@ class ApiError(SikkerfilError):
 class AuthenticationError(ApiError):
     """401/403: the credential is missing, wrong, revoked, or not allowed here.
 
-    Worth knowing which: API keys work on ``POST /api/shares`` and
-    ``GET /api/account/shares``. Revoking a share and reading its audit trail
+    Worth knowing which: API keys work on ``POST /api/v1/shares`` and
+    ``GET /api/v1/account/shares``. Revoking a share and reading its audit trail
     take the WRITE TOKEN issued when the share was created, or a browser
     session — not a key. And minting keys takes a session, never a key.
     """

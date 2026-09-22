@@ -22,7 +22,7 @@ from sikkerfil.errors import (
     DownloadsExhaustedError,
     PasswordRequiredError,
 )
-from sikkerfil.transport import DIGEST_HEADER, sha256_hex
+from sikkerfil.transport import API_PREFIX, DIGEST_HEADER, sha256_hex
 
 PLAINTEXT = b"Kvartalsrapport Q3\nOmsetning: 4 200 000 NOK\n"
 
@@ -81,7 +81,7 @@ def test_the_share_is_created_for_the_ciphertext_size(client: Sikkerfil, stub) -
     enforces the same rule, so this would fail loudly rather than subtly.
     """
     sent = client.send(PLAINTEXT, filename="x.bin")
-    created = json.loads(next(r for r in stub.requests if r.path == "/api/shares").body)
+    created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert created["sizeBytes"] == len(PLAINTEXT) + crypto.IV_BYTES + crypto.TAG_BYTES
     assert sent.size_bytes == created["sizeBytes"]
 
@@ -128,7 +128,7 @@ def test_an_open_file_works_and_text_mode_is_refused(client: Sikkerfil, tmp_path
 
 def test_bytes_with_no_name_seal_no_name(client: Sikkerfil, stub) -> None:
     sent = client.send(PLAINTEXT)
-    created = json.loads(next(r for r in stub.requests if r.path == "/api/shares").body)
+    created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert "encryptedName" not in created
     assert client.receive(sent.url).filename is None
 
@@ -151,7 +151,7 @@ def test_options_reach_the_service(client: Sikkerfil, stub) -> None:
         password="hemmelig",
         name="kvartalsrapport",
     )
-    created = json.loads(next(r for r in stub.requests if r.path == "/api/shares").body)
+    created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert created["expiresInSeconds"] == 3600
     assert created["maxDownloads"] == 2
     assert created["password"] == "hemmelig"
@@ -177,7 +177,7 @@ def test_the_origin_is_sent_only_for_a_real_market(stub) -> None:
     """
     client = Sikkerfil(api_key="k", base_url=stub.base_url, retries=0)
     client.send(PLAINTEXT)
-    created = json.loads(next(r for r in stub.requests if r.path == "/api/shares").body)
+    created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert "origin" not in created
 
     from sikkerfil.client import Sikkerfil as Real

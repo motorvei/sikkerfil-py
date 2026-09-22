@@ -41,6 +41,12 @@ and ``x-sikkerfil-token``, and the same run confirms the first rule:
 
 — the last one being the request reaching the service and being refused for the
 only thing actually missing, a credential.
+
+Those runs predate the /api/v1 prefix and their addresses are left exactly as
+requested, because a measurement rewritten to a path that was never tested is
+not a measurement. The behaviour they establish is a property of the CDN in
+front of the service, not of any one route, and the prefix does not change it:
+this library sends /api/v1/... and still supplies the digest on every POST.
 """
 
 from __future__ import annotations
@@ -73,6 +79,16 @@ TOKEN_HEADER = "x-sikkerfil-token"
 
 #: The digest header the edge requires on every signed POST. See the module docstring.
 DIGEST_HEADER = "x-amz-content-sha256"
+
+#: The API version every address carries: /api/v1/...
+#:
+#: The service also still answers the unversioned form, as a legacy alias for
+#: browser bundles cached before the prefix existed. This library does not use
+#: it: an address without a version is outside the compatibility promise
+#: published on /utviklere, and a client that quietly relies on an alias is a
+#: client that breaks the day the alias goes.
+API_VERSION = "v1"
+API_PREFIX = f"/api/{API_VERSION}"
 
 USER_AGENT = "sikkerfil-python"
 
@@ -320,7 +336,7 @@ def _auth_hint(code: str | None, url: str) -> str:
             "a leaked key must not be able to issue itself a sibling. Manage keys "
             "at https://sikkerfil.no/konto"
         )
-    if "/audit" in url or url.rstrip("/").count("/api/shares/") == 1:
+    if "/audit" in url or url.rstrip("/").count(f"{API_PREFIX}/shares/") == 1:
         return (
             "not authorised. Revoking a share and reading its audit trail take the "
             "WRITE TOKEN issued when the share was created (or a browser session) — "
