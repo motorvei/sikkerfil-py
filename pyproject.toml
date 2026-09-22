@@ -1,0 +1,96 @@
+[project]
+name = "sikkerfil"
+version = "0.1.0"
+description = "Client for sikkerfil.no — files encrypted in your process, stored in Stockholm, never readable by the service."
+readme = "README.md"
+# 3.10 AND UP. Python 3.9 reached end of life in October 2025 and no longer
+# receives security fixes; a library whose whole job is handling other people's
+# confidential files has no business inviting anyone onto an unpatched runtime.
+# It is also the floor the test matrix actually covers — claiming a version
+# nothing verifies is a promise, not a fact.
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "motorvei.com" }]
+keywords = ["sikkerfil", "encryption", "file-sharing", "gdpr", "schrems"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security :: Cryptography",
+  "Typing :: Typed",
+]
+
+# TWO DEPENDENCIES, AND THE LIST IS A DESIGN DECISION.
+#
+# `cryptography` is not optional: Python's standard library has no AES-GCM, and
+# the envelope this service uses is AES-256-GCM or it is not interoperable with
+# the browser. pyca/cryptography is the audited implementation with wheels on
+# every platform anyone will run this on.
+#
+# `certifi` is here for one specific failure. The HTTP side is stdlib urllib,
+# which verifies against the SYSTEM trust store — and a python.org install on
+# macOS ships without one, so the first call a new user makes dies with
+# "certificate verify failed" and they conclude the service is broken. certifi
+# is a file of PEM text with no build step; it costs nothing and removes the
+# single most common first-run failure.
+#
+# What is deliberately NOT here is an HTTP client. requests or httpx would be
+# the reflex, and the whole protocol is four JSON calls and two blob transfers.
+# A security library that pulls a transitive tree into a customer's environment
+# is asking them to audit our taste in dependencies as well as our code.
+dependencies = [
+  "cryptography>=41.0",
+  "certifi>=2023.7.22",
+]
+
+[project.urls]
+Homepage = "https://sikkerfil.no"
+Documentation = "https://sikkerfil.no/utviklere"
+Source = "https://github.com/motorvei/sikkerfil-py"
+
+[project.scripts]
+sikkerfil = "sikkerfil.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=7.4",
+  "mypy>=1.8",
+  "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sikkerfil"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]
+
+# The library's own types are what users consume, so src is checked strictly.
+# Tests are checked too — a wrong type there is still a wrong test — but pytest
+# fixtures arrive untyped by construction and annotating every one of them buys
+# noise rather than safety.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

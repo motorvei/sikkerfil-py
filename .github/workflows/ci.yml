@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling of what pyproject claims to support. The
+        # versions between them differ in nothing this library touches, and CI
+        # minutes are not free.
+        python: ['3.10', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # NODE IS NOT INCIDENTAL. tests/test_interop.py runs the browser's own
+      # WebCrypto calls to prove the encryption envelope matches the web client
+      # byte for byte. Without node those tests SKIP, and a skipped test is a
+      # green tick that proves nothing — which is exactly the failure that would
+      # ship a file our own website cannot open.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --dev
+
+      - run: uv run ruff check .
+      - run: uv run mypy
+
+      # CI=true makes tests/test_interop.py assert node is present rather than
+      # skipping, so this cannot pass with the interop coverage silently gone.
+      - name: tests
+        env:
+          CI: 'true'
+        run: uv run pytest -q
+
+      # THE PACKAGE MUST BE INSTALLABLE, NOT MERELY IMPORTABLE FROM THE TREE.
+      # Everything above runs against src/ through uv's editable install. A
+      # missing py.typed, a package left out of the wheel, or an entry point
+      # that does not resolve all survive that and fail for the first person who
+      # pip-installs it.
+      - name: the built wheel installs and works
+        run: |
+          uv build
+          uv run --isolated --no-project --with dist/*.whl -- python -c "
+          import sikkerfil, pathlib, sikkerfil.crypto as c
+          sealed = c.seal(b'from the wheel')
+          assert c.open_sealed(sealed.blob, sealed.key) == b'from the wheel'
+          assert pathlib.Path(sikkerfil.__file__).with_name('py.typed').exists(), 'py.typed missing from the wheel'
+          print('wheel ok', sikkerfil.__version__)
+          "
+          uv run --isolated --no-project --with dist/*.whl -- sikkerfil --version
