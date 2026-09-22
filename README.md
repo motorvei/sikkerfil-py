@@ -132,7 +132,8 @@ yourself:
 ```python
 from sikkerfil import crypto
 
-name = crypto.open_name(share.encrypted_name, crypto.b64url_decode(key))
+key = crypto.b64url_decode("the part after #k= in the link")
+name = crypto.open_name(share.encrypted_name, key)
 ```
 
 `receive()` does that for you and puts the result on `ReceivedFile.filename`.
