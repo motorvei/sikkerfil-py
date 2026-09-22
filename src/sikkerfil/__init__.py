@@ -45,7 +45,7 @@ from .errors import (
 from .links import MARKETS, build_link, parse_link
 from .models import AuditEvent, ReceivedFile, SentShare, Share
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 __all__ = [
     "MARKETS",
