@@ -83,8 +83,8 @@ def parse_link(link: str) -> ParsedLink:
         if SHARE_NAME.match(head):
             return ParsedLink(origin="", share_id=None, name=head, key=key)
         raise ConfigurationError(
-            f"{link!r} is not a share link, a share id ({SHARE_ID.pattern}) "
-            f"or a named link ({SHARE_NAME.pattern})"
+            f"{redacted(link)!r} is not a share link, a share id "
+            f"({SHARE_ID.pattern}) or a named link ({SHARE_NAME.pattern})"
         )
 
     parts = urlsplit(text)
@@ -106,7 +106,7 @@ def parse_link(link: str) -> ParsedLink:
         return ParsedLink(origin=origin, share_id=None, name=path, key=key)
 
     raise ConfigurationError(
-        f"{link!r} does not look like a share link. Expected "
+        f"{redacted(link)!r} does not look like a share link. Expected "
         "https://sikkerfil.no/s/<id>#k=<key> or https://sikkerfil.no/<name>#k=<key>"
     )
 
@@ -155,3 +155,19 @@ def _key_from_fragment(fragment: str) -> str | None:
         if sep and name == "k":
             return unquote(value) or None
     return unquote(fragment) or None
+
+
+def redacted(link: str) -> str:
+    """``link`` with the key taken out, for anything that will be read by a human.
+
+    THE MODULE DOCSTRING ABOVE SAYS A LOG LINE CARRYING THE FRAGMENT UNDOES THE
+    PRODUCT, and an exception message is a log line: applications log what they
+    did not catch, and error trackers keep it. So the message a caller gets names
+    what was wrong with the link — which is always the part BEFORE the ``#`` —
+    and says the key was there without repeating it.
+
+    A recipient pasting a link whose path we do not recognise is the ordinary
+    case here, not an exotic one, and their link carries a working key.
+    """
+    head, sep, fragment = link.partition("#")
+    return f"{head}#<key>" if sep and fragment else head

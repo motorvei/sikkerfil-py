@@ -105,10 +105,17 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
         # Both spellings of "not base64url" land here: binascii.Error for bad
         # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
         except (TypeError, ValueError):
+            # THE VALUE IS NOT IN THIS MESSAGE, deliberately. A key that fails
+            # to decode is usually a nearly correct key — one pasted character
+            # short, or with a smart quote in it — and repeating it here puts it
+            # in whatever log swallows the traceback. The whole premise is that
+            # the key never reaches a log.
             raise ConfigurationError(
-                f"a sikkerfil key is base64url text or 32 raw bytes; {key!r} is "
-                "neither. The text is what Sealed.key_text gives you, and what "
-                "follows #k= in a share link."
+                "a sikkerfil key is base64url text or 32 raw bytes; this is "
+                f"{len(key)} characters that will not decode as base64url. The "
+                "value is not repeated here because it is a decryption key. The "
+                "text is what Sealed.key_text gives you, and what follows #k= in "
+                "a share link."
             ) from None
     if len(raw) != KEY_BYTES:
         raise ConfigurationError(

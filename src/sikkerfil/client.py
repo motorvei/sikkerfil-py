@@ -51,6 +51,7 @@ from .links import (
     base_url_for,
     build_link,
     parse_link,
+    redacted,
 )
 from .models import AuditEvent, ReceivedFile, SentShare, Share
 from .transport import API_PREFIX, DEFAULT_TIMEOUT, KEY_HEADER, TOKEN_HEADER, Transport
@@ -262,7 +263,8 @@ class Sikkerfil:
         secret = given or in_link or ""
         if not secret:
             raise ConfigurationError(
-                f"no decryption key for {parsed.reference or link!r}. The key is "
+                f"no decryption key for {parsed.reference or redacted(link)!r}. "
+                "The key is "
                 "the part after '#k=' in the share link, and without it the bytes "
                 "cannot be opened by anyone — including us.\n"
                 "  - Recipient: ask the sender for the whole link, fragment and "
