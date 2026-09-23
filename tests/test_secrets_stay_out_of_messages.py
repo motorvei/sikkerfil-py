@@ -1948,11 +1948,13 @@ def test_an_ordinary_passphrase_is_not_a_key() -> None:
             _nothing_here_is_a_key(password=value)
         assert label
 
-    # THE ONE CASE THE FOLD HELD AND NOTHING ELSE DOES, asserted as a gap so that it
-    # is a decision rather than a discovery: a PARTIAL key with whitespace pushed into
-    # it. Thirty-three of a key's forty-three characters, spaced out, is not exactly a
-    # key in any spelling and has no run of 32 as written.
-    _nothing_here_is_a_key(password=" ".join(key[:33]))
+    # THE GAP THIS ROUND OPENED AND THE NEXT ONE CLOSED. A PARTIAL key with whitespace
+    # pushed into it was asserted here as the fold's one casualty. It is not one any
+    # more: _reads_as_words puts the fold back for any value whose whitespace is not
+    # separating words, and single characters are not words. Kept as an assertion
+    # rather than deleted, because it is the case the next round was found by.
+    with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+        _nothing_here_is_a_key(password=" ".join(key[:33]))
 
     # The echo path is unchanged and still folds, because printing a spaced-out key
     # hands it over whatever its shape — the reader deletes the spaces.
@@ -1960,3 +1962,209 @@ def test_an_ordinary_passphrase_is_not_a_key() -> None:
 
     assert carries_key_material(" ".join(key))
     assert "not repeated" in quoted(" ".join(key[:33]))
+
+
+# --- Round twenty-four: the fold was load-bearing for a DECORATED key ------------
+
+
+def test_a_decorated_key_with_whitespace_in_it_is_still_caught() -> None:
+    """THE CORRECTION TO LAST ROUND'S CLAIM, which was wrong in one move.
+
+    I took the whitespace-folded spellings away from the run test and wrote that
+    "nothing that was held by the fold is lost", naming one exception: a PARTIAL key.
+    ``"user:" + key[:20] + " " + key[20:]`` carries all forty-three characters, its
+    folded form is not exactly a key because of the prefix, and neither raw piece
+    reaches the threshold — so the fold was load-bearing for a decorated key too, and
+    the value went to the service.
+
+    The fold is back, gated on whether the whitespace is separating WORDS: pieces of
+    at least two characters with no capital after the first. A random key's pieces are
+    drawn from an alphabet half of which is upper case, so eight of them pass that at
+    about three in a hundred million; prose passes it always.
+    """
+    from sikkerfil.client import _nothing_here_is_a_key
+    from sikkerfil.links import opaque_carries_key_material
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for decoration in ("user:", "user ", "key=", "old-", "1 ", "A"):
+        for cut in (1, 5, 10, 20, 21, 30, 42):
+            for gap in (" ", "\t", "\n", "  "):
+                spelled = f"{decoration}{key[:cut]}{gap}{key[cut:]}"
+                assert opaque_carries_key_material(spelled), (decoration, cut, gap)
+                with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+                    _nothing_here_is_a_key(password=spelled)
+    # And behind it too, which is the other half of "decorated".
+    for cut in (10, 21, 30):
+        assert opaque_carries_key_material(f"{key[:cut]} {key[cut:]}-old")
+
+    # THE PROSE THIS MUST NOT COST, which is the whole reason the gate exists.
+    for passphrase in (
+        "the quick brown fox jumps over the lazy dogs",
+        "correct horse battery staple and one more word",
+        "min hemmelige passordfrase for kvartalsrapporten 2026",
+        "Correct Horse Battery Staple And One More Word",
+        "dette er en ganske lang passordfrase med mange ord",
+    ):
+        _nothing_here_is_a_key(password=passphrase)
+
+
+def test_a_component_join_is_normalised_before_it_is_read() -> None:
+    """NFKC BELONGS IN THE COMPONENT JOINS TOO — the fullwidth round, for the third time.
+
+    A hostname built from the fullwidth forms of ``raw_key.hex(".")`` is thirty-two
+    labels of two characters each. Nothing in the join sees hex, because the digits are
+    U+FF10 rather than U+0030 — and Python's IDNA processing normalises that hostname
+    back to ordinary dotted hex before it resolves it, so the whole key goes out over
+    DNS to whoever runs it.
+    """
+    import unicodedata
+
+    from sikkerfil.links import origin_of, path_carries_key_material
+
+    def fullwidth(text: str) -> str:
+        return "".join(
+            chr(ord(c) - 0x21 + 0xFF01) if 0x21 <= ord(c) <= 0x7E else c for c in text
+        )
+
+    raw = bytes(range(32))
+    for separator in (".", "-"):
+        wide = fullwidth(raw.hex(separator))
+        assert unicodedata.normalize("NFKC", wide) == raw.hex(separator)
+        assert origin_of(f"https://{wide}/x") == "", separator
+    # Fullwidth two-character labels with ORDINARY slashes between them: the
+    # components are fullwidth, the separators are not, which is what a path is.
+    assert path_carries_key_material("/tmp/" + "/".join(fullwidth(p) for p in
+                                                        (raw.hex()[i : i + 2] for i in
+                                                         range(0, 64, 2))))
+
+    # The hosts and paths this must not cost. NFKC is the identity on both.
+    assert origin_of("https://private.secure.files.company.internal.example.com/x") != ""
+    assert not path_carries_key_material("/home/me/Downloads/kvartalsrapport-2026-q3.pdf")
+
+
+def test_a_rendering_inside_one_component_is_caught() -> None:
+    """THE JOIN LOOP STARTS AT THE COMPONENT AFTER start, so one never got asked.
+
+    ``prefix-<32 bytes in dotted hex>-suffix`` is a single filename.
+    ``renders_key_bytes_strictly_inside`` was written for exactly this shape a round
+    earlier and was never asked of a path component, so ``send()`` echoed the whole
+    thing in a "no such file" and ``save()`` would write it to disk.
+    """
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    raw = bytes(range(32))
+    for name in (
+        f"prefix-{raw.hex('.')}-suffix",
+        f"{raw.hex(':')}.bak",
+        f"dump-{raw.hex('-')}",
+    ):
+        assert path_carries_key_material(f"/tmp/{name}"), name
+        assert not _leaks(redacted_path(f"/tmp/{name}"))
+        # The directory the caller needs still prints; only the component goes.
+        assert "/tmp/" in redacted_path(f"/tmp/{name}")
+
+    # Measured cost of adding this: 5 paths in 60,026 on this machine (0.008%).
+    for ordinary in (
+        "/home/me/Downloads/kvartalsrapport-2026-q3.pdf",
+        "/etc/systemd/system/multi-user.target.wants/ssh.service",
+        "/usr/lib/python3.13/site-packages/pytest/__init__.py",
+    ):
+        assert not path_carries_key_material(ordinary), ordinary
+
+
+def test_an_altchar_is_a_byte_not_an_ascii_character() -> None:
+    """``altchars`` TAKES ARBITRARY BYTES, and isascii() threw half of them away."""
+    import base64
+
+    from sikkerfil.links import opaque_carries_key_material, renders_key_bytes
+
+    for altchars in (b"\xff!", b"!\xff", b"\xe5\xf8", b"\xc0\xc1"):
+        for payload in (b"\xfb" * 32, bytes(range(32))):
+            spelling = base64.b64encode(payload, altchars=altchars).decode("latin1")
+            assert base64.b64decode(spelling.encode("latin1"), altchars=altchars) == payload
+            assert renders_key_bytes(spelling), altchars
+            assert opaque_carries_key_material(spelling), altchars
+
+
+def test_empty_components_do_not_bring_the_quadratic_back() -> None:
+    """THE CEILING ADVANCES BY ADDING CHARACTERS, so a component with none never moves it.
+
+    Bounding the subsequence scan by joined width fixed the 25-second path and left
+    ``"/" * 4000`` — four thousand empty components, width stuck at zero, every start
+    walking to the end again. Empty components are dropped before the walk now: one
+    cannot be part of a rendering, so it cannot belong in the answer either.
+    """
+    import time
+
+    from sikkerfil.links import path_carries_key_material
+
+    for path in ("/" * 4000, "/" * 20000, "\\" * 4000, "/a" + "/" * 4000 + "b"):
+        started = time.perf_counter()
+        path_carries_key_material(path)
+        spent = time.perf_counter() - started
+        assert spent < 2.0, f"{len(path)} separators took {spent:.1f}s"
+
+    # And an empty component between two halves of a key is still a key.
+    key = crypto.b64url_encode(bytes(range(32)))
+    assert path_carries_key_material(f"/tmp/{key[:21]}//{key[21:]}")
+
+
+def test_the_repr_of_a_bytearray_key_is_a_rendering() -> None:
+    """``key_text`` ACCEPTS A BYTEARRAY, so its repr is a rendering of a supported value.
+
+    ``repr(bytearray(raw_key))`` is ``bytearray(b'\\x00\\x01…')`` — produced by the
+    standard library from a value this library takes at the door, fully reversible, and
+    made of two-character pieces that no run test will ever see.
+    """
+    from sikkerfil.links import opaque_carries_key_material, quoted, renders_key_bytes
+
+    raw = bytes(range(32))
+    assert crypto.key_text(bytearray(raw)) == crypto.b64url_encode(raw)
+    for spelling in (repr(bytearray(raw)), repr(bytes(raw)), f"{bytearray(raw)!r}"):
+        assert renders_key_bytes(spelling), spelling[:30]
+        assert opaque_carries_key_material(spelling), spelling[:30]
+        assert "not repeated" in quoted(spelling), spelling[:30]
+
+    # A bytearray of the wrong size is not a key, and neither is prose in a wrapper.
+    assert not renders_key_bytes(repr(bytearray(b"hello")))
+    assert not renders_key_bytes("bytearray(something else)")
+
+
+def test_a_parameter_value_is_asked_about_containment_not_exactness() -> None:
+    """'note="user:<a key>"' — the same correction, in a fourth slot.
+
+    Asking whether the whole parameter value IS a rendering let a five-character prefix
+    defeat it while all forty-three characters of the key went to the service. A
+    parameter value is as free as a password, so it gets the predicate a password gets.
+    """
+    import base64
+    import mimetypes
+
+    from sikkerfil.client import _is_a_content_type
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for decorated in (
+        f"user:{key}",
+        f"{key}-old",
+        f"{key} extra",
+        base64.b64encode(bytes(range(32))).decode(),
+        f"x{bytes(range(32)).hex()}",
+    ):
+        assert not _is_a_content_type(f'text/plain; note="{decorated}"'), decorated[:24]
+
+    for ordinary in (
+        "text/plain; charset=utf-8",
+        'text/csv; charset="utf-8"',
+        # THE BOUNDARY WEBKIT ACTUALLY GENERATES, which is why the run threshold is
+        # not the predicate here. Thirty-seven characters of the alphabet in a row,
+        # chosen by the browser rather than the caller: my first attempt at this fix
+        # refused it, and the suite said so.
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWx",
+        'application/octet-stream; name="kvartalsrapport-2026-q3.pdf"',
+        'application/pdf; filename="Kvartalsrapport 2026 Q3.pdf"',
+    ):
+        assert _is_a_content_type(ordinary), ordinary
+    for suffix in (".cii", ".pdf", ".xlsx", ".docx", ".csv", ".odt", ".zip", ".json", ".bin"):
+        guessed = mimetypes.guess_type("x" + suffix)[0] or "application/octet-stream"
+        assert _is_a_content_type(guessed), guessed

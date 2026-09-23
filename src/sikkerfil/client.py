@@ -608,7 +608,21 @@ def _is_a_content_type(value: str) -> bool:
     # it, it is as free as a password, and a refusal is explainable. So
     # 'text/plain; key="<b64encode(key, altchars=b"~!")>"' is caught here, where the
     # narrow checks could not see its alphabet.
-    if any(links.renders_key_bytes(given) for _, given in _content_type_parameters(value)):
+    # CONTAINMENT, NOT EXACTNESS, and that correction has now been made in four slots.
+    # Asking whether the whole value IS a rendering let 'note="user:<a key>"' past: the
+    # prefix is five characters and the key is all forty-three of them.
+    #
+    # BUT NOT THE RUN THRESHOLD EITHER, which is what I reached for first and what the
+    # suite caught: opaque_carries_key_material refuses 32 characters of the alphabet
+    # in a row, and boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW is thirty-seven of
+    # them. That is a value WebKit generates and the caller cannot shorten — refusing
+    # it is the media-type mistake again, one parameter to the right. So the question
+    # is whether a WHOLE key is in there: holds_a_key, plus the rendering tests for a
+    # value that is one end to end.
+    if any(
+        links.renders_key_bytes(given) or links.holds_a_key(given)
+        for _, given in _content_type_parameters(value)
+    ):
         return False
     # EVERY TOKEN, not the whole string and one join. "text/<a key>" and
     # "text/plain; <a key>=x" are both valid media types whose surrounding text makes

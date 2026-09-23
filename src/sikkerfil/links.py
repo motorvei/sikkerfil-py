@@ -507,9 +507,12 @@ def _is_base64_under_some_altchars(compact: str) -> bool:
     strange = {character for character in spelled if character not in _BASE64_CORE}
     if len(strange) > 2:
         return False
-    # altchars is two BYTES. A character that does not fit in one is not one of them,
-    # and "=" is padding rather than an alphabet letter.
-    return all(character.isascii() and character != "=" for character in strange)
+    # altchars is two BYTES — not two ASCII characters, which is where the first
+    # version of this drew the line. b64encode(b"\xfb" * 32, altchars=b"\xff!")
+    # round-trips through latin-1, and "\xff" is a perfectly good altchar that
+    # isascii() threw away. Anything that fits in one byte can be one; "=" cannot,
+    # because it is padding rather than a letter of the alphabet.
+    return all(ord(character) < 256 and character != "=" for character in strange)
 
 
 def _is_hex_of_a_key(compact: str) -> bool:
@@ -621,8 +624,18 @@ def spells_a_key_exactly(text: str) -> bool:
 
 
 def _is_a_bytes_literal_of_a_key(value: str) -> bool:
-    """``repr(key)`` — what an f-string does to raw bytes, and what a log line keeps."""
+    """``repr(key)`` — what an f-string does to raw bytes, and what a log line keeps.
+
+    BYTEARRAY TOO, because ``key_text`` accepts one. This library documents that a key
+    may be handed over as raw bytes and takes a bytearray at the door, so
+    ``repr(bytearray(raw_key))`` is a rendering the standard library produces from a
+    value this library itself supports — and its ``\\xNN`` pieces are two characters
+    long, so no run test will ever see it either. The wrapper comes off and the literal
+    inside is read exactly as ``repr(bytes)`` is.
+    """
     text = value.strip()
+    if text.startswith("bytearray(") and text.endswith(")"):
+        text = text[len("bytearray(") : -1].strip()
     if not text.startswith(("b'", 'b"')) or len(text) > 4 * KEY_BYTES * 8:
         return False
     try:
@@ -725,7 +738,29 @@ def _components(path: str) -> list[str]:
 
 
 def _parts_carrying_key(parts: Sequence[str], *, chunk_floor: int = 4) -> set[int]:
-    """Which components could carry key material — alone, or joined to a neighbour.
+    """Which components could carry key material, AS WRITTEN AND NORMALISED.
+
+    NFKC BELONGS HERE TOO, and that it did not was the fullwidth transcription for the
+    third time. A hostname built from the fullwidth forms of ``raw_key.hex(".")`` is
+    thirty-two labels of two characters each; nothing in the join sees hex, because
+    the digits are U+FF10 and not U+0030 — and Python's IDNA processing normalises
+    that hostname back to ordinary dotted hex before it resolves it, so the complete
+    key goes out over DNS.
+
+    Run twice rather than normalised in place, because normalisation can change a
+    component's LENGTH (a ligature is one character and two afterwards) and the base64
+    pass reports which component a window touched by measuring them. Two passes over
+    per-component normalisation keep the indices meaning the same thing in both.
+    """
+    suspect = _parts_carrying_key_as_written(parts, chunk_floor=chunk_floor)
+    normalised = [unicodedata.normalize("NFKC", part) for part in parts]
+    if normalised != list(parts):
+        suspect |= _parts_carrying_key_as_written(normalised, chunk_floor=chunk_floor)
+    return suspect
+
+
+def _parts_carrying_key_as_written(parts: Sequence[str], *, chunk_floor: int = 4) -> set[int]:
+    """One reading of the components. See :func:`_parts_carrying_key`.
 
     A KEY SPLIT ACROSS COMPONENTS is carried by none of them on its own:
     ``key[:21] + "/" + key[21:]`` has two parts, both under the threshold, and the
@@ -770,7 +805,19 @@ def _parts_carrying_key(parts: Sequence[str], *, chunk_floor: int = 4) -> set[in
         for index, part in enumerate(parts)
         if len(part) >= KEY_RUN and _run_in(part, _KEY_CHARACTERS) and not _holds_a_key(part)
     ]
-    for run in _contiguous(fragments):
+    # AN EMPTY COMPONENT IS TRANSPARENT, NOT A BREAK. "//" between two halves of a key
+    # is one component of nothing: it contributes no characters to any join, and the
+    # filesystem collapses it before anybody reads the path — Path("/tmp/a//b") is
+    # "/tmp/a/b". Letting it end a run of fragments made "<key[:21]>//<key[21:]>" two
+    # runs of one, and a run of one is not a join. Contiguity is counted over the
+    # components that have characters in them.
+    rank: dict[int, int] = {}
+    for index, part in enumerate(parts):
+        if part:
+            rank[index] = len(rank)
+    by_rank = {rank[index]: index for index in fragments if index in rank}
+    for ranks in _contiguous(sorted(by_rank)):
+        run = [by_rank[position] for position in ranks]
         joined = "".join(parts[index] for index in run)
         spans, position = [], 0
         for index in run:
@@ -869,20 +916,34 @@ def _subsequence_renders_key_strictly(parts: Sequence[str]) -> set[int]:
     # WHITESPACE IS TAKEN OUT FIRST, because renders_key_bytes_strictly takes it out
     # too: measuring "my report.txt" as thirteen characters when the test will see
     # twelve would skip the length that matches.
-    compacted = ["".join(part.split()) for part in parts]
+    # EMPTY COMPONENTS ARE DROPPED FIRST, and leaving them in put the quadratic back.
+    # The ceiling stops a walk by ADDING characters, so a component contributing none
+    # never advances it: "/" * 4000 is four thousand empty parts, width stays at zero,
+    # and every start walks to the end again. They are dropped rather than skipped
+    # inside the loop, because an empty component cannot be part of a rendering and so
+    # cannot belong in the answer either.
+    indexed = [(at, "".join(part.split())) for at, part in enumerate(parts) if part.strip()]
     suspect: set[int] = set()
-    for start in range(len(compacted)):
-        width = len(compacted[start])
+    # A WHOLE RENDERING CAN SIT INSIDE ONE COMPONENT, which the join loop below cannot
+    # see because it starts at the component AFTER start. "prefix-<32 bytes in dotted
+    # hex>-suffix" is a single filename, and renders_key_bytes_strictly_inside was
+    # written for exactly this and was never asked here.
+    for at, piece in indexed:
+        if renders_key_bytes_strictly_inside(piece):
+            suspect.add(at)
+    for first in range(len(indexed)):
+        width = len(indexed[first][1])
         if width > _WIDEST_STRICT:
             continue
-        for end in range(start + 1, len(compacted)):
-            width += len(compacted[end])
+        for last in range(first + 1, len(indexed)):
+            width += len(indexed[last][1])
             if width > _WIDEST_STRICT:
                 break
             if width not in _STRICT_WIDTHS:
                 continue
-            if renders_key_bytes_strictly("".join(compacted[start : end + 1])):
-                suspect.update(range(start, end + 1))
+            joined = "".join(piece for _, piece in indexed[first : last + 1])
+            if renders_key_bytes_strictly(joined):
+                suspect.update(at for at, _ in indexed[first : last + 1])
     return suspect
 
 
@@ -953,6 +1014,23 @@ def _contiguous(indexes: Sequence[int]) -> list[list[int]]:
         else:
             runs.append([index])
     return [run for run in runs if len(run) > 1]
+
+
+def holds_a_key(value: str) -> bool:
+    """Whether ``value`` CONTAINS a complete key, in any spelling of it.
+
+    BETWEEN EXACTNESS AND THE RUN THRESHOLD, and both of those were wrong for a
+    Content-Type parameter value. Exactness let ``note="user:<a key>"`` through, since
+    five characters of prefix mean the value is not a key. The run threshold refused
+    ``boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW``, which is thirty-seven
+    characters of the alphabet and is what WebKit actually generates — a value the
+    caller did not choose and cannot shorten.
+
+    So this asks for a whole key: forty-three characters, in some window, in some
+    spelling. A decoration in front of one does not help, and a value too short to
+    hold one is not asked to justify itself.
+    """
+    return _holds_a_key(value)
 
 
 def _holds_a_key(joined: str) -> bool:
@@ -1196,8 +1274,39 @@ def _spellings(value: str) -> tuple[str, ...]:
     return (value, "".join(value.split()), folded, "".join(folded.split()))
 
 
+def _reads_as_words(value: str) -> bool:
+    """Whether the whitespace in ``value`` is separating WORDS rather than laying a
+    rendering out.
+
+    THIS IS THE DISCRIMINATOR THE LAST ROUND NEEDED AND DID NOT HAVE. I took the
+    whitespace-folded spellings away from the run test because folding them turned a
+    passphrase into a run — and claimed in the commit that nothing held by the fold was
+    lost. That was wrong, and the review found it in one move: ``"user:" + key[:20] +
+    " " + key[20:]`` carries all forty-three characters of the key, its folded form is
+    not EXACTLY a key because of the prefix, and neither raw piece reaches the
+    threshold. The fold was load-bearing for a decorated key with whitespace in it, not
+    only for a bare one.
+
+    So the fold comes back, gated on what the whitespace is doing. A piece of prose is
+    at least two characters long and has no capital in it after the first — which is
+    what a word looks like in every market this ships to, and what a piece of base64
+    does not: a random key's forty-three characters are drawn from an alphabet that is
+    half upper case, so for a value split into eight pieces the chance that every piece
+    passes this is about (38/64) ** 35, which is three in a hundred million. Single
+    characters are excluded by the length rule, which is what ``" ".join(key)`` is.
+
+    It is a heuristic and it is a heuristic about the SPELLING, not the value: getting
+    it wrong costs a caller whose passphrase is written in capitals, and the run test
+    then reads their folded text as it did before this round.
+    """
+    pieces = value.split()
+    if len(pieces) < 2:
+        return False
+    return all(len(piece) > 1 and not any(c.isupper() for c in piece[1:]) for piece in pieces)
+
+
 def _spellings_with_their_whitespace(value: str) -> tuple[str, ...]:
-    """The same spellings, MINUS the two with the whitespace taken out.
+    """The same spellings, minus the whitespace-folded two WHEN IT READS AS PROSE.
 
     FOR THE RUN TEST, AND ONLY THERE, because folding the whitespace before counting
     a run turns a passphrase into one. "the quick brown fox jumps over the lazy dog"
@@ -1220,7 +1329,15 @@ def _spellings_with_their_whitespace(value: str) -> tuple[str, ...]:
     The echo path keeps the fold: carries_key_material, which is what quoted() asks
     before printing a value, still reads every spelling. Printing a spaced-out key
     hands it over whatever its shape, because the reader deletes the spaces.
+
+    AND THE FOLD COMES BACK WHEN THE WHITESPACE IS NOT WORD SEPARATION, which is the
+    correction to the paragraph above. "Nothing that was held by the fold is lost" was
+    false: a DECORATED key with whitespace in it was held by it and by nothing else,
+    because the prefix stops the folded form from being exactly a key. See
+    :func:`_reads_as_words` for what is being told apart and what that costs.
     """
+    if not _reads_as_words(value):
+        return _spellings(value)
     folded = unicodedata.normalize("NFKC", value)
     return (value, folded)
 
