@@ -352,7 +352,31 @@ def path_carries_key_material(path: str) -> bool:
     used the value threshold here anyway, which cost this suite's own tmp_path a
     second time.
     """
-    return structured_carries_key(_components(path))
+    return _is_a_key_spelled_with_slashes(path) or structured_carries_key(_components(path))
+
+
+def _is_a_key_spelled_with_slashes(value: str) -> bool:
+    """Whether ``value`` IS a key, with standard base64's ``/`` and ``+`` in it.
+
+    THE SLASHES FALL WHERE THE BYTES FALL. A key re-encoded with standard base64
+    rather than base64url puts "/" and "+" wherever the data puts them — 20/6/15,
+    not 11/11/11/10 — so the uniformity gate that catches a hand-chunked key does
+    nothing here, and neither does dropping the separators, because these separators
+    ARE key characters.
+
+    ANCHORED ON THE WHOLE VALUE, deliberately and at a cost. Reading every
+    separator-delimited span that way redacts 7.7% of the real paths on this machine,
+    and reading every window redacts 50%; requiring the entire value to be exactly a
+    key's length costs 0.18% — paths like /usr/share/clang/scan-view-18/bin/scan-view,
+    which are 43 characters with no dot in them, and which lose their name in a
+    "no such file" message and nothing else.
+
+    THE GAP THIS LEAVES, said plainly: the same spelling nested inside a longer path,
+    "/tmp/<that value>", is not caught. Catching it means reading an ordinary
+    separator as a key character somewhere, and every version of that I could measure
+    costs more paths than it is worth.
+    """
+    return len(value) == KEY_TEXT_LENGTH and looks_like_a_key(_aliased(value))
 
 
 def redacted_path(path: str) -> str:
@@ -371,6 +395,8 @@ def redacted_path(path: str) -> str:
     names a directory. The two numbers answer genuinely different questions: for a
     value, refusing costs nothing; for a path, refusing costs the name.
     """
+    if _is_a_key_spelled_with_slashes(path):
+        return f"<{len(path)} characters, not repeated>"
     pieces = _SEPARATORS.split(path)
     parts = pieces[::2]
     separators = pieces[1::2]
@@ -477,13 +503,20 @@ def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
     # are read as underscores — and a key chunked four ways by hand is the same
     # shape. Neither piece reaches KEY_RUN, so neither is a fragment.
     #
-    # Reading every path that way is not an option: aliasing the separators of
-    # /home/user/sikkerfil-py/src/sikkerfil/errors.py gives 43 characters of the
-    # alphabet too. Measured over 99,595 real paths on this machine, that reading
-    # redacts HALF of them. What separates the two is uniformity — a key cut into
-    # pieces is cut at a fixed width, by whoever cut it — so a run of neighbouring
-    # components whose lengths are within two of each other is read with its
-    # separators as underscores. Same corpus: 57 of 99,595, 0.06%.
+    # THE SEPARATORS ARE DROPPED, NOT TRANSLATED, and the difference is the whole of
+    # a P2 I earned. I first joined these with "_" — which works only because an
+    # underscore happens to be a base64url character — and _parts_carrying_key is
+    # also what origin_of asks about DNS labels. So
+    # private.secure.files.company.internal.example, whose labels are 7/6/5/7/8/7,
+    # joined to 45 characters with the dots read as underscores and was refused: an
+    # ordinary custom origin broken, for the fourth time on this branch, by a leak
+    # fix of mine. Dropping the separators is also the correct reading of the thing
+    # being caught — somebody chunked a key, the separators are not part of it — and
+    # those same labels then join to 40 characters, which is not a key.
+    #
+    # The uniformity gate stays: a key cut into pieces is cut at a fixed width, by
+    # whoever cut it, while /home/me/Documents/work/2026/rapporter is not. Measured
+    # over 99,595 real paths on this machine, this redacts 0.06% of them.
     suspect |= _uniform_run_carrying_key(parts)
     return suspect
 
@@ -494,7 +527,7 @@ def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
     run: list[int] = []
 
     def close() -> None:
-        if len(run) >= 2 and _holds_a_key("_".join(parts[index] for index in run)):
+        if len(run) >= 2 and _holds_a_key("".join(parts[index] for index in run)):
             suspect.update(run)
 
     for index, part in enumerate(parts):

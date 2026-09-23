@@ -1131,3 +1131,112 @@ def test_a_key_chunked_across_path_components_is_caught() -> None:
     ):
         assert not path_carries_key_material(ordinary), ordinary
         assert redacted_path(ordinary) == ordinary
+
+
+# --- Round fifteen: where the slashes fall, and a prefix worn by the wrong secret
+
+
+def test_a_key_spelled_in_standard_base64_is_caught_however_it_falls() -> None:
+    """THE SLASHES FALL WHERE THE BYTES FALL, not at a width somebody chose.
+
+    A key re-encoded with standard base64 puts "/" and "+" wherever the data puts
+    them — 20/6/15, not 11/11/11/10 — so the uniformity gate that catches a
+    hand-chunked key does nothing, and dropping the separators does nothing either,
+    because here the separators ARE key characters.
+    """
+    import base64
+
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    spellings = [
+        "A" * 20 + "/" + "A" * 6 + "/" + "A" * 15,
+        ("A" * 10 + "/") * 3 + "A" * 10,
+        base64.b64encode(bytes(range(32))).decode().rstrip("="),
+        base64.b64encode(bytes(range(200, 232))).decode().rstrip("="),
+    ]
+    for spelling in spellings:
+        assert len(spelling) == 43, spelling
+        assert path_carries_key_material(spelling), spelling
+        assert redacted_path(spelling) == "<43 characters, not repeated>"
+
+    # THE COST, MEASURED AND ACCEPTED: a path that is exactly 43 characters with no
+    # dot in it loses its name in a "no such file" message. 0.18% of the real paths
+    # on the machine this was written on; every wider anchor costs far more (7.7% for
+    # separator-delimited spans, 50% for every window).
+    assert path_carries_key_material("/usr/share/clang/scan-view-18/bin/scan-view")
+    # One character either side and it prints again, which is what "anchored" means.
+    assert not path_carries_key_material("/usr/share/clang/scan-view-18/bin/scan-vie")
+    assert not path_carries_key_material("/usr/share/clang/scan-view-18/bin/scan-view2")
+
+
+def test_an_ordinary_custom_origin_with_even_labels_still_works() -> None:
+    """THE FOURTH TIME A LEAK FIX OF MINE BROKE A WORKING DEPLOYMENT.
+
+    The run that catches a chunked key was joining components with "_" — which works
+    only because an underscore is a base64url character — and the same function
+    answers for DNS labels. So private.secure.files.company.internal.example, whose
+    labels are 7/6/5/7/8/7 and therefore "uniform", joined to 45 characters and was
+    refused.
+
+    The separators are DROPPED now rather than translated, which is also the correct
+    reading of the thing being caught: somebody chunked a key, and the separators are
+    not part of it. Those labels join to 40 characters, which is not a key.
+    """
+    from sikkerfil.links import origin_of
+
+    for host in (
+        "private.secure.files.company.internal.example",
+        "files.secure.internal.example",
+        "a.b.c.d.e.f.example",
+        "delivery.sikkerfil-staging.example.com",
+    ):
+        assert origin_of(f"https://{host}/x") == f"https://{host}", host
+        assert parse_link(f"https://{host}/s/ABCD1234").origin == f"https://{host}"
+
+    # And the split key the rule exists for is still caught.
+    lowercase = crypto.key_text("a" * 42 + "g")
+    assert origin_of(f"https://{lowercase[:21]}.{lowercase[21:]}/x") == ""
+    quartered = ".".join(
+        [lowercase[:11], lowercase[11:22], lowercase[22:33], lowercase[33:]]
+    )
+    assert origin_of(f"https://{quartered}/x") == ""
+
+
+def test_the_share_key_wearing_a_credential_prefix_is_still_the_key() -> None:
+    """The prefix that makes a credential recognisable makes a key unrecognisable.
+
+    ``revoke(sent, write_token="wt_" + sent.key)`` is what an application produces
+    when it stores the wrong secret and adds the documented prefix around it: the
+    comparison tried to decode the whole thing, failed, and said "not the key" — and
+    transport then saw wt_ and 43 characters of base64url, which is exactly what a
+    real write token is.
+    """
+    from sikkerfil.models import SentShare
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    sent = SentShare(
+        id="ABCD1234",
+        url=f"https://sikkerfil.no/s/ABCD1234#k={key}",
+        write_token="wt_" + "y" * 43,
+        key=key,
+        expires_at=1_700_000_000,
+        size_bytes=10,
+    )
+    attempted: list[str] = []
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempted.extend(f"{n}: {v}" for n, v in request.header_items())
+        raise urllib.error.URLError("the test does not use the network")
+
+    client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.request, "urlopen", spy)
+        for worn in ("wt_" + key, "sikkerfil_sk_" + key, "wt_" + key + "==", key):
+            with pytest.raises(ConfigurationError, match=r"this share's DECRYPTION KEY"):
+                client.revoke(sent, write_token=worn)
+        assert not attempted, attempted
+
+        # The token it was actually issued still goes.
+        with contextlib.suppress(Exception):
+            client.revoke(sent)
+    assert any("wt_yyy" in line for line in attempted), attempted

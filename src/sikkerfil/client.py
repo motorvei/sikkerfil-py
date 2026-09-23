@@ -57,7 +57,14 @@ from .links import (
     redacted,
 )
 from .models import AuditEvent, ReceivedFile, SentShare, Share
-from .transport import API_PREFIX, DEFAULT_TIMEOUT, KEY_HEADER, TOKEN_HEADER, Transport
+from .transport import (
+    API_PREFIX,
+    CREDENTIAL_PREFIXES,
+    DEFAULT_TIMEOUT,
+    KEY_HEADER,
+    TOKEN_HEADER,
+    Transport,
+)
 
 #: Accepted sources for a send: a path, raw bytes, or an open binary file.
 Source = Union[str, "os.PathLike[str]", bytes, bytearray, IO[bytes]]
@@ -649,11 +656,27 @@ def _same_key(candidate: str, key: str) -> bool:
 
     Through key_text so that padding, a newline or a line wrap do not make one key
     read as two — the comparison links.looks_like_a_key was written for.
+
+    AND WITH THE CREDENTIAL PREFIX TAKEN OFF, which is what this missed: "wt_" in
+    front of the share's own key decodes as nothing, so the comparison said "not the
+    key" — and transport then saw wt_ and 43 characters of base64url, which is
+    exactly what a real write token is, and sent the file's key to the service. The
+    prefix that makes a credential recognisable also makes a key wearing it
+    unrecognisable, so it comes off before the two are compared. An application that
+    stores the secret and adds the documented prefix around it produces precisely
+    this value.
     """
-    try:
-        return crypto.key_text(candidate) == crypto.key_text(key)
-    except ConfigurationError:
-        return False
+    spellings = [candidate]
+    for prefix in CREDENTIAL_PREFIXES:
+        if candidate.startswith(prefix):
+            spellings.append(candidate[len(prefix) :])
+    for spelling in spellings:
+        try:
+            if crypto.key_text(spelling) == crypto.key_text(key):
+                return True
+        except ConfigurationError:
+            continue
+    return False
 
 
 def _download_refusal(exc: ApiError, share: Share, password_given: bool) -> ApiError:

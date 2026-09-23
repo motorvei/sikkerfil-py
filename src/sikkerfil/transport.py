@@ -114,6 +114,12 @@ DIGEST_HEADER = "x-amz-content-sha256"
 _API_KEY = re.compile(r"sikkerfil_sk_[A-Za-z0-9_-]{43}")
 _WRITE_TOKEN = re.compile(r"wt_[A-Za-z0-9_-]{43}")
 
+#: The prefixes those two shapes put in front of their 43 characters. Exported
+#: because client._same_key has to take one off before it can compare a credential
+#: with a key: "wt_" + the share's own key is a perfectly shaped write token, and
+#: the thing behind the prefix is the file's key.
+CREDENTIAL_PREFIXES = ("wt_", "sikkerfil_sk_")
+
 #: Keyed on the header constants rather than repeating their spellings, so a third
 #: credential header cannot quietly escape the check.
 _CREDENTIAL_SHAPES = {KEY_HEADER: _API_KEY, TOKEN_HEADER: _WRITE_TOKEN}
