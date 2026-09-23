@@ -1207,13 +1207,27 @@ def test_an_ordinary_custom_origin_with_even_labels_still_works() -> None:
         assert origin_of(f"https://{host}/x") == f"https://{host}", host
         assert parse_link(f"https://{host}/s/ABCD1234").origin == f"https://{host}"
 
-    # And the split key the rule exists for is still caught.
+    # And the split key the rule exists for is still caught — in halves and in
+    # thirds, where every piece clears KEY_RUN.
     lowercase = crypto.key_text("a" * 42 + "g")
     assert origin_of(f"https://{lowercase[:21]}.{lowercase[21:]}/x") == ""
-    quartered = ".".join(
-        [lowercase[:11], lowercase[11:22], lowercase[22:33], lowercase[33:]]
-    )
-    assert origin_of(f"https://{quartered}/x") == ""
+    thirds = ".".join([lowercase[:15], lowercase[15:30], lowercase[30:]])
+    assert origin_of(f"https://{thirds}/x") == ""
+
+    # THE GAP, NARROWED DELIBERATELY AND ASSERTED AS A GAP. A key cut into four
+    # eleven-character labels is no longer refused, because catching it means letting
+    # a run form out of labels shorter than KEY_RUN — and a domain is a handful of
+    # short labels, so that is what refused
+    # private.secure.files.company.internal.example.com twice. On a host a piece of a
+    # key has to be at least KEY_RUN characters; four pieces of eleven is a
+    # construction nobody registers by accident, and five hostname regressions on
+    # this branch is enough.
+    quartered = ".".join([lowercase[:11], lowercase[11:22], lowercase[22:33], lowercase[33:]])
+    assert origin_of(f"https://{quartered}/x") != ""
+    # It is still refused as a PATH, where short components are not the norm.
+    from sikkerfil.links import path_carries_key_material
+
+    assert path_carries_key_material(quartered.replace(".", "/"))
 
 
 def test_the_share_key_wearing_a_credential_prefix_is_still_the_key() -> None:
@@ -1377,3 +1391,92 @@ def test_the_renderings_a_path_message_must_still_print() -> None:
     ):
         assert not path_carries_key_material(ordinary), ordinary
         assert redacted_path(ordinary) == ordinary
+
+
+# --- Round eighteen: base85, a media type, and a path that only exists joined ---
+
+
+def test_base85_renderings_are_refused_as_a_value() -> None:
+    """The set was "what the standard library produces" and I left two encoders out.
+
+    WHAT THIS TEST IS ACTUALLY WORTH, stated because the code says it too: b85's
+    alphabet covers every letter and digit, so any forty alphanumeric characters
+    decode to 32 bytes — a sha1 digest does. This is a length test at forty, exactly
+    as the base64 one is a length test at forty-three. It is asked only about a whole
+    value for that reason, and a caller whose password is forty characters of that
+    alphabet is refused by name.
+    """
+    import base64
+
+    from sikkerfil.links import opaque_carries_key_material, path_carries_key_material
+
+    for payload in (bytes(range(32)), b"?" * 32):
+        for rendering in (base64.a85encode(payload), base64.b85encode(payload)):
+            spelling = rendering.decode()
+            assert len(spelling) == 40
+            assert opaque_carries_key_material(spelling), spelling
+            assert path_carries_key_material(spelling), spelling
+
+
+def test_a_registered_media_type_is_not_a_key() -> None:
+    """A run of 32 characters in a MIME type is a registered subtype, not a key.
+
+    ``mimetypes.guess_type("x.cii")`` returns a 54-character media type, and the run
+    threshold refused it while ``_guess_type`` generated and sent the identical value
+    when ``content_type`` was left out. Refusing a value the library itself produces
+    is not a security property, it is a bug with a security-shaped excuse.
+    """
+    import mimetypes
+
+    from sikkerfil.client import _is_a_content_type
+
+    # Every type the standard library will hand us for a plausible attachment.
+    for suffix in (".cii", ".pdf", ".xlsx", ".docx", ".csv", ".odt", ".zip", ".json", ".bin"):
+        guessed = mimetypes.guess_type("x" + suffix)[0] or "application/octet-stream"
+        assert _is_a_content_type(guessed), guessed
+
+    # And the shapes that are not media types, including the one that is BOTH a valid
+    # media type by RFC 6838 and a key in standard base64.
+    for refused in (
+        SECRET,
+        f"{SECRET[:20]}/{SECRET[20:]}",
+        "A" * 20 + "/" + "A" * 22,
+        "not a media type",
+        "application/",
+        "",
+    ):
+        assert not _is_a_content_type(refused), refused
+
+
+def test_a_rendering_that_only_exists_once_the_path_is_joined_is_refused(tmp_path) -> None:
+    """Neither half carries it; the join does.
+
+    ``b64encode`` of 32 bytes is ``Pz8/Pz8/…/Pz8=`` — which ``os.path.split`` turns
+    into ten three-character directories and a four-character filename, so the
+    directory check and the name check both passed and ``open()`` got the whole
+    reversible thing. The same route runs through the CLI's ``receive -o``.
+    """
+    import base64
+
+    from sikkerfil.links import joined_path_spells_a_key
+
+    rendering = base64.b64encode(b"?" * 32).decode()
+    assert joined_path_spells_a_key(rendering)
+    # A key cut in two by the join, which is the other way a path spells one. (An
+    # extra separator pushed INTO a rendering that already has its own — 45
+    # characters of which one must be deleted and the others kept — is not caught,
+    # and I wrote that assertion before checking it: a gap, not a behaviour.)
+    assert joined_path_spells_a_key(f"{SECRET[:21]}/{SECRET[21:]}")
+
+    # AND THE PATHS THIS SUITE ITSELF WRITES TO, because the first version of this
+    # check asked the full predicate and refused them: "…/test_a_hostile_filename_
+    # canno0/authorized_keys" is 30 characters and 15, the shape of a split at width
+    # thirty, and "…/test_a_tilde_in_the_directory_0/Downloads" is 31 and 9, which is
+    # forty characters and therefore a base85 rendering of something.
+    for ordinary in (
+        str(tmp_path / "rapport.pdf"),
+        "/tmp/pytest-of-user/pytest-257/test_a_hostile_filename_canno0/authorized_keys",
+        "/tmp/pytest-of-user/pytest-257/test_a_tilde_in_the_directory_0/Downloads/rapport.pdf",
+        "/home/me/Downloads/kvartalsrapport-2026-q3.pdf",
+    ):
+        assert not joined_path_spells_a_key(ordinary), ordinary

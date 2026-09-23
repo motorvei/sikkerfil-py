@@ -559,3 +559,36 @@ def test_a_standard_base64_key_never_reaches_a_request_body(
     with pytest.raises(ConfigurationError):
         client.receive(sent.url, password=spelling)
     assert len(stub.requests) == before
+
+
+def test_a_long_registered_content_type_reaches_the_service(client: Sikkerfil, stub) -> None:
+    """THROUGH send(), not through the predicate.
+
+    ``mimetypes.guess_type("x.cii")`` returns a 54-character media type, and the run
+    threshold refused it — while leaving the argument out sent the identical value,
+    because ``_guess_type`` generates it. A guard that refuses what the library itself
+    produces is a bug with a security-shaped excuse.
+
+    The predicate had a test and this call site did not, so swapping the check back to
+    the run heuristic broke nothing.
+    """
+    import mimetypes
+
+    guessed = mimetypes.guess_type("x.cii")[0]
+    assert guessed and len(guessed) > 32
+
+    client.send(PLAINTEXT, filename="x.cii", content_type=guessed)
+    created = json.loads(stub.requests[-3].body)
+    assert created["contentType"] == guessed
+
+    # Leaving it out sends the same thing, which is the inconsistency that made the
+    # refusal indefensible.
+    client.send(PLAINTEXT, filename="x.cii")
+    assert json.loads(stub.requests[-3].body)["contentType"] == guessed
+
+    # A key with a separator pushed into it is still refused: the grammar accepts it
+    # and deleting the slash gives back the key.
+    key = crypto.b64url_encode(bytes(range(32)))
+    for shaped in (f"{key[:20]}/{key[20:]}", key, "A" * 20 + "/" + "A" * 22):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=shaped)

@@ -18,6 +18,7 @@ guarantee the key never reaches a request.
 from __future__ import annotations
 
 import ast
+import base64
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -301,7 +302,8 @@ def origin_of(link: str) -> str:
         return ""
 
     decoded = unquote(host)
-    if structured_carries_key(decoded.replace(":", ".").split(".")):
+    # THE HOSTNAME FLOOR, for the reason written on _uniform_run_carrying_key.
+    if structured_carries_key(decoded.replace(":", ".").split("."), chunk_floor=KEY_RUN):
         return ""
 
     authority = f"[{host}]" if ":" in host else host
@@ -324,7 +326,7 @@ def redacted(link: str) -> str:
     return f"{origin}/<unrecognised>" if origin else "<unrecognised>"
 
 
-def structured_carries_key(parts: Sequence[str]) -> bool:
+def structured_carries_key(parts: Sequence[str], *, chunk_floor: int = 4) -> bool:
     """Whether a value split into ``parts`` carries a key — as a part, or across them.
 
     THE SEPARATOR WAS THE BYPASS, three times in one review. Checking components
@@ -341,7 +343,7 @@ def structured_carries_key(parts: Sequence[str]) -> bool:
     Exactly a key was not enough, though — see _parts_carrying_key, which does the
     work for both this and the redaction, so the two cannot answer differently.
     """
-    return bool(_parts_carrying_key(parts))
+    return bool(_parts_carrying_key(parts, chunk_floor=chunk_floor))
 
 
 def path_carries_key_material(path: str) -> bool:
@@ -398,7 +400,39 @@ def renders_key_bytes(value: str) -> bool:
         else:
             return True
 
-    return _is_a_bytes_literal_of_a_key(value)
+    if _is_a_bytes_literal_of_a_key(value):
+        return True
+
+    # BASE85, BOTH OF THE STANDARD LIBRARY'S. a85encode and b85encode turn 32 bytes
+    # into 40 characters, and I claimed last round that the set was "the set the
+    # standard library produces" while leaving two of its encoders out — the claim was
+    # the part that was wrong, not the list.
+    #
+    # WHAT THIS TEST ACTUALLY IS, said plainly: b85's alphabet covers every letter and
+    # digit, so ANY forty alphanumeric characters decode to 32 bytes — a sha1 digest
+    # does. This is a length test, exactly as the base64 one is, and it is worth it
+    # here because it is anchored on a whole value: 85 of 99,608 real paths on this
+    # machine are 40 characters end to end (0.085%). The cost that is not measurable
+    # is a caller whose PASSWORD is forty characters of that alphabet; they are
+    # refused, by name, with a message that says what to change.
+    for decode in (base64.a85decode, base64.b85decode):
+        try:
+            if len(decode(compact)) == KEY_BYTES:
+                return True
+        except (ValueError, TypeError):
+            continue
+
+    return False
+
+
+def _spells_a_key_exactly(text: str) -> bool:
+    """Whether ``text`` is a key in the base64 family, and nothing longer or shorter.
+
+    The narrow question, for asking about a JOIN. renders_key_bytes answers the wide
+    one, about a whole value a caller handed over.
+    """
+    compact = _aliased("".join(text.split())).rstrip("=")
+    return len(compact) == KEY_TEXT_LENGTH and looks_like_a_key(compact)
 
 
 def _is_a_bytes_literal_of_a_key(value: str) -> bool:
@@ -440,6 +474,25 @@ def _is_a_key_spelled_with_slashes(value: str) -> bool:
     # come off in renders_key_bytes, which also knows the renderings that are not
     # base64 at all.
     return renders_key_bytes(value)
+
+
+def joined_path_spells_a_key(path: str) -> bool:
+    """Whether a path SPELLS a key once its separators are read as part of it.
+
+    NARROWER THAN path_carries_key_material, DELIBERATELY. This is asked about the
+    path that ``ReceivedFile.save`` is about to open, after the directory and the name
+    have each been checked on their own — so the only thing left to catch is a
+    rendering that the join put back together: "Pz8/Pz8/…/Pz8=" is b64encode of 32
+    bytes and also ten directories and a filename.
+
+    Asking the full predicate there was wrong, and its own test suite said so within a
+    minute: "…/test_a_hostile_filename_canno0/authorized_keys" is 30 characters and 15,
+    which is the shape of a split at width thirty, and the fragment pass finds a
+    key-sized window in their 45-character join. That pass exists for a key with
+    DECORATION on it, where loose matching earns its keep; a caller saving a file into
+    a directory whose name is long is not that.
+    """
+    return renders_key_bytes(path) or bool(_uniform_run_carrying_key(_components(path)))
 
 
 def redacted_path(path: str) -> str:
@@ -486,7 +539,7 @@ def _components(path: str) -> list[str]:
     return _SEPARATORS.split(path)[::2]
 
 
-def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
+def _parts_carrying_key(parts: Sequence[str], *, chunk_floor: int = 4) -> set[int]:
     """Which components could carry key material — alone, or joined to a neighbour.
 
     A KEY SPLIT ACROSS COMPONENTS is carried by none of them on its own:
@@ -580,12 +633,23 @@ def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
     # The uniformity gate stays: a key cut into pieces is cut at a fixed width, by
     # whoever cut it, while /home/me/Documents/work/2026/rapporter is not. Measured
     # over 99,595 real paths on this machine, this redacts 0.06% of them.
-    suspect |= _uniform_run_carrying_key(parts)
+    suspect |= _uniform_run_carrying_key(parts, chunk_floor)
     return suspect
 
 
-def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
-    """Components of an evenly-chunked run whose separators complete a key."""
+def _uniform_run_carrying_key(parts: Sequence[str], chunk_floor: int = 4) -> set[int]:
+    """Components of an evenly-chunked run whose separators complete a key.
+
+    ``chunk_floor`` IS HIGHER FOR A HOSTNAME, and that is the fifth hostname
+    regression on this branch talking. A domain is a handful of SHORT labels, and
+    four of them concatenate past forty-three characters without anybody chunking
+    anything: private.secure.files.company.internal.example.com became "a key" the
+    moment a three-character TLD could join a run as its remainder. On a host a piece
+    of a key has to be at least KEY_RUN characters — the same threshold the rest of
+    this module uses for "long enough to be part of a key" — which leaves a hostname
+    chunked into pieces of eleven uncaught, and that is a deliberate construction
+    rather than a name anybody registers.
+    """
     suspect: set[int] = set()
     run: list[int] = []
 
@@ -596,7 +660,22 @@ def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
         # and a stranded remainder. So a component too short to continue a run is
         # still tried as its end.
         widest = run if remainder is None else [*run, remainder]
-        if len(widest) >= 2 and _holds_a_key("".join(parts[index] for index in widest)):
+        # THE PIECES MUST ADD UP TO A KEY AND NOTHING MORE. Looking for a key-sized
+        # WINDOW in the join was too loose the moment a remainder could join a run:
+        # "test_a_hostile_filename_canno0/authorized_keys" is 30 and 15, which is
+        # exactly the shape of a split at width thirty, and its 45-character join
+        # contains a 43-character window. Somebody who chunked a key produced a
+        # partition OF that key, so the join is the key — nothing before it, nothing
+        # after. Decoration on a chunk is the fragment pass's business, where the
+        # pieces are long enough to be worth joining loosely.
+        #
+        # AND THE BASE64 FAMILY ONLY, not every rendering. Base85 turns 32 bytes into
+        # FORTY characters of an alphabet that covers every letter and digit, so "any
+        # forty alphanumerics" decode to 32 bytes — which is tolerable as a question
+        # about one whole value and is not tolerable here, where every pair of
+        # neighbouring components is a candidate. This suite's own tmp_path said so:
+        # "test_a_tilde_in_the_directory_0" and "Downloads" are 31 and 9.
+        if len(widest) >= 2 and _spells_a_key_exactly("".join(parts[index] for index in widest)):
             suspect.update(widest)
 
     for index, part in enumerate(parts):
@@ -604,7 +683,7 @@ def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
         # character — wrap(key, 20) gives 20/20/3 — so it is asked about as an end
         # before the run is closed without it, and only its alphabet matters there.
         alphabet = bool(part) and bool(_EVENLY_CHUNKED.fullmatch(part))
-        even = alphabet and len(part) >= 4
+        even = alphabet and len(part) >= chunk_floor
         if even and (not run or abs(len(part) - len(parts[run[0]])) <= _CHUNK_SLACK):
             run.append(index)
             continue

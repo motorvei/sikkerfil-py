@@ -215,6 +215,20 @@ class ReceivedFile:
             )
         safe = os.path.basename(chosen.replace("\\", "/")).lstrip(".") or f"{self.share.id}.bin"
         path = os.path.join(os.path.expanduser(directory), safe)
+        # AND THE JOINED PATH, which neither of the two checks above can see. A
+        # rendering that contains separators is split by them: b64encode of 32 bytes
+        # is "Pz8/Pz8/…/Pz8=", which os.path.split turns into ten three-character
+        # directories and a four-character filename, so the directory check and the
+        # name check both pass and open() receives the whole recoverable thing —
+        # writing it into the filesystem, or naming it in FileNotFoundError.filename.
+        # The same route runs through the CLI's `receive -o`.
+        if links.joined_path_spells_a_key(path):
+            raise ConfigurationError(
+                "the path this file would be written to carries what looks like a "
+                "decryption key once the directory and the name are joined. It is "
+                "not repeated here. Pass a directory and a filename that do not "
+                "spell one — save('.', filename='rapport.pdf')."
+            )
         with open(path, "wb") as handle:
             handle.write(self.data)
         return path

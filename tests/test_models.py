@@ -101,3 +101,31 @@ def test_a_share_knows_whether_it_has_bytes_yet() -> None:
 
 def test_a_received_file_reports_its_length() -> None:
     assert len(received("x")) == len(b"contents")
+
+
+def test_a_rendering_split_across_directory_and_name_is_refused(tmp_path, monkeypatch) -> None:
+    """THROUGH save(), not through the predicate.
+
+    The predicate had a test and this call site did not, so deleting the check from
+    save() broke nothing at all — the third time on this branch that a fix was held
+    only by a test of the thing it calls rather than of the thing that calls it.
+
+    ``b64encode`` of 32 bytes is ``Pz8/Pz8/…/Pz8=``: as a directory and a filename
+    neither half carries a key, and the join is the whole reversible rendering.
+    """
+    import base64
+
+    from sikkerfil.errors import ConfigurationError
+
+    rendering = base64.b64encode(b"?" * 32).decode()
+    directory, name = rendering.rsplit("/", 1)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ConfigurationError, match="joined"):
+        received(name).save(directory)
+    assert not list(tmp_path.iterdir()), "it wrote something before refusing"
+
+    # And an ordinary save into a directory that does not exist yet still fails the
+    # way it always did — as a filesystem error naming the path, not as a refusal.
+    with pytest.raises(FileNotFoundError):
+        received("rapport.pdf").save(str(tmp_path / "nope"))

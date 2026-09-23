@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import IO, Any, Union
 from urllib.parse import urlsplit
@@ -549,6 +550,28 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
     raise ConfigurationError(f"cannot send a {type(source).__name__}; pass a path, bytes or a file")
 
 
+#: A media type, by RFC 6838: a restricted name, a slash, a restricted name. Used
+#: instead of a run threshold for content_type, which is a registered token and not
+#: a caller's invention.
+_MEDIA_TOKEN = r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}"
+_MEDIA_TYPE = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}")
+
+
+def _is_a_content_type(value: str) -> bool:
+    """Whether ``value`` is a media type AND not a key wearing one's shape.
+
+    THREE QUESTIONS, because a media type has a slash in it and so does standard
+    base64. The grammar alone accepts ``<20 characters of key>/<23 more>``; the
+    rendering check alone does not see it either, because inserting a separator makes
+    the value 44 characters and the anchor asks for 43. What reverses that value is
+    deleting the slash, so the slash-joined form is asked about as well — the same
+    reading the path predicate gives a chunked key.
+    """
+    if not _MEDIA_TYPE.fullmatch(value) or links.renders_key_bytes(value):
+        return False
+    return not links.renders_key_bytes(value.replace("/", ""))
+
+
 def _nothing_here_is_a_key(
     *,
     name: str | None = None,
@@ -577,9 +600,18 @@ def _nothing_here_is_a_key(
     slashes it reads as four short components and passes. These are opaque values,
     not paths, so they get opaque_carries_key_material, which folds that alias in.
 
-    * ``name`` becomes a path component of a public link (``sikkerfil.no/<name>``) and
-      ``content_type`` is ``type/subtype``; both take the PATH threshold, the one that
-      leaves ``kvartalsrapport-2026-q3`` and ``application/octet-stream`` alone.
+    * ``name`` becomes a path component of a public link (``sikkerfil.no/<name>``), so
+      it takes the PATH threshold — the one that leaves ``kvartalsrapport-2026-q3``
+      alone.
+    * ``content_type`` IS CHECKED AS A MEDIA TYPE, not with that threshold, and that
+      is a correction. A run of 32 characters is not a key in a MIME type, it is a
+      registered subtype: mimetypes.guess_type("x.cii") returns
+      "application/vnd.anser-web-certificate-issue-initiation", which this refused
+      while _guess_type generated and sent the identical value when the argument was
+      left out. Refusing a value the library itself produces is not a security
+      property. So the shape is checked against RFC 6838, and the rendering check is
+      asked as well — because "A"*20 + "/" + "A"*22 is both a valid media type by
+      that grammar and a key in standard base64.
     * ``password`` gets the same threshold, AFTER EXACTNESS WAS TRIED AND WAS WRONG.
       "Only a value that is a key to the character" reads as careful and let
       ``user:<key>`` and ``<key>-old`` through — each carrying all 256 bits to the
@@ -595,11 +627,12 @@ def _nothing_here_is_a_key(
             "a key in it is published as well as disclosed. The key belongs after "
             "'#k=' in the link the send returns. The value is not repeated here."
         )
-    if content_type and links.opaque_carries_key_material(content_type):
+    if content_type and not _is_a_content_type(content_type):
         raise ConfigurationError(
-            "the content type given carries what looks like a decryption key. It is "
-            "sent to the service as a hint for the recipient, which is the one place "
-            "a key must never go. The value is not repeated here."
+            "the content type given is not a media type, or it carries what looks "
+            "like a decryption key. It is sent to the service as a hint for the "
+            "recipient, which is the one place a key must never go. Expected "
+            "type/subtype, as in application/pdf. The value is not repeated here."
         )
     if password and links.opaque_carries_key_material(password):
         raise ConfigurationError(
