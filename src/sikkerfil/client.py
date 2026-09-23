@@ -562,6 +562,11 @@ _MEDIA_TOKEN = r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}"
 _PARAMETER_TOKEN = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
 _QUOTED_STRING = r'"(?:[^"\\]|\\.)*"'
 _PARAMETER = rf";[ \t]*{_PARAMETER_TOKEN}=(?:{_PARAMETER_TOKEN}|{_QUOTED_STRING})"
+
+#: ``\X`` inside a quoted string is ``X``, per RFC 9110. HTTP takes the backslash
+#: out before anybody reads the value, so a check that leaves it in reads a string
+#: the recipient never sees — the same mistake as reading a percent-encoded host.
+_QUOTED_PAIR = re.compile(r"\\(.)")
 _MEDIA_TYPE = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}(?:[ \t]*{_PARAMETER})*[ \t]*")
 
 
@@ -577,20 +582,33 @@ def _is_a_content_type(value: str) -> bool:
     """
     if not _MEDIA_TYPE.fullmatch(value) or links.renders_key_bytes(value):
         return False
-    if links.renders_key_bytes(value.replace("/", "")):
-        return False
-    # AND EVERY PARAMETER VALUE ON ITS OWN. Allowing parameters opens a place to put
-    # a key that none of the questions above reach: "text/plain; charset=<a key>" is
-    # a perfectly good media type by the grammar, and the whole string is not a
-    # rendering of anything. Nobody reported this one — it arrived with the fix for
-    # the parameters, which is the shape of mistake this branch keeps making.
+    # EVERY TOKEN, not the whole string and one join. "text/<a key>" and
+    # "text/plain; <a key>=x" are both valid media types whose surrounding text makes
+    # the WHOLE value too long to decode as anything — and my previous version looked
+    # at the complete value, the slash-deleted value, and the text after each "=",
+    # which is three places out of five. A key does not care which token it is in.
+    return not any(links.renders_key_bytes(token) for token in _content_type_tokens(value))
+
+
+def _content_type_tokens(value: str) -> list[str]:
+    """Every part of a Content-Type a key could be hiding in, plus the joins.
+
+    The type, the subtype, both of them with the slash deleted, and each parameter's
+    NAME and VALUE — the value with its quoted-pairs undone, because HTTP takes those
+    backslashes out and the grammar lets them in: ``k="<key with a backslash before
+    every tenth character>"`` passed every check while unescaping to the key.
+    """
     head, _, parameters = value.partition(";")
+    kind, _, subtype = head.strip().partition("/")
+    tokens = [head.strip(), head.replace("/", "").strip(), kind, subtype]
     for parameter in parameters.split(";"):
-        _, _, given = parameter.partition("=")
-        candidate = given.strip().strip('"')
-        if candidate and links.opaque_carries_key_material(candidate):
-            return False
-    return not links.renders_key_bytes(head.replace("/", ""))
+        name, _, given = parameter.partition("=")
+        tokens.append(name.strip())
+        given = given.strip()
+        if given.startswith('"') and given.endswith('"') and len(given) >= 2:
+            given = _QUOTED_PAIR.sub(r"\1", given[1:-1])
+        tokens.append(given)
+    return [token for token in tokens if token]
 
 
 def _nothing_here_is_a_key(

@@ -1284,7 +1284,7 @@ def _every_rendering_the_standard_library_makes(raw: bytes) -> dict[str, str]:
     """
     import base64
 
-    return {
+    renderings = {
         "b64encode": base64.b64encode(raw).decode(),
         "b64encode unpadded": base64.b64encode(raw).decode().rstrip("="),
         "urlsafe_b64encode": base64.urlsafe_b64encode(raw).decode(),
@@ -1297,7 +1297,18 @@ def _every_rendering_the_standard_library_makes(raw: bytes) -> dict[str, str]:
         "hex with dashes": raw.hex("-"),
         "repr": repr(raw),
         "a85encode adobe": base64.a85encode(raw, adobe=True).decode(),
+        "a85encode foldspaces": base64.a85encode(raw, foldspaces=True).decode(),
+        "a85encode adobe+foldspaces": base64.a85encode(raw, adobe=True, foldspaces=True).decode(),
+        # EVERY SEPARATOR bytes.hex() will take, not the two I thought of.
+        **{f"hex({sep!r})": raw.hex(sep) for sep in ".:-_|+ "},
+        "hex grouped": raw.hex(" ", 4),
+        "hex 0x": "0x" + raw.hex(),
     }
+    # z85 exists from 3.13, which this package supports; the interpreter running the
+    # tests is not the only one a caller has.
+    if hasattr(base64, "z85encode"):
+        renderings["z85encode"] = base64.z85encode(raw).decode()
+    return renderings
 
 
 @pytest.mark.parametrize("payload", [bytes(range(32)), b"?" * 32, bytes(range(200, 232))])

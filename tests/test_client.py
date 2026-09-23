@@ -626,3 +626,39 @@ def test_a_parameterised_content_type_reaches_the_service(client: Sikkerfil, stu
         with pytest.raises(ConfigurationError):
             client.send(PLAINTEXT, content_type=refused)
     assert len(stub.requests) == before
+
+
+def test_a_key_in_any_content_type_token_is_refused(client: Sikkerfil, stub) -> None:
+    """THE TYPE, THE SUBTYPE, A PARAMETER NAME, AND AN ESCAPED VALUE.
+
+    My previous version looked at the whole value, the slash-deleted value, and the
+    text after each "=" — three places out of five. ``text/<a key>`` and
+    ``text/plain; <a key>=x`` are both valid media types whose surrounding text makes
+    the whole string too long to decode, and a quoted value can spell the key with a
+    backslash before every tenth character: the grammar allows the escapes, HTTP
+    removes them, and my check read the string with them still in.
+    """
+    key = crypto.b64url_encode(bytes(range(32)))
+    escaped = "\\".join(key[i : i + 10] for i in range(0, len(key), 10))
+    before = len(stub.requests)
+    for refused in (
+        f"text/{key}",
+        f"{key}/plain",
+        f"text/plain; {key}=x",
+        f'text/plain; k="{escaped}"',
+        f'text/plain; k="{bytes(range(32)).hex(".")}"',
+        f"text/plain; charset={base64.a85encode(b' ' * 32, foldspaces=True).decode()}",
+    ):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=refused)
+    assert len(stub.requests) == before, "a request went out before the refusal"
+
+    # And the Content-Type values a real caller sends, including a boundary of the
+    # length people actually generate.
+    for accepted in (
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+        'text/csv; charset="utf-8"',
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ):
+        client.send(PLAINTEXT, content_type=accepted)
+        assert json.loads(stub.requests[-3].body)["contentType"] == accepted

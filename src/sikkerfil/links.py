@@ -389,9 +389,15 @@ def renders_key_bytes(value: str) -> bool:
     if len(spelled) == KEY_TEXT_LENGTH and looks_like_a_key(spelled):
         return True
 
-    # Hex, as hex(), hex(":") and hex("-") write it. Not "0x"-prefixed: that is a
-    # different rendering and it is one character from this one.
-    hexish = compact.replace(":", "").replace("-", "").removeprefix("0x")
+    # Hex, with whatever bytes.hex(sep=...) was given. Naming ":" and "-" was
+    # enumerating again — hex(".") and hex("_") and hex("|") are the same rendering —
+    # so the separator is whatever single character is in the way, which is what
+    # hex(sep) produces by construction. One character: a value with two kinds of
+    # punctuation in it is not a hex dump.
+    hexish = compact.removeprefix("0x")
+    strange = {character for character in hexish if character not in _HEX_DIGITS}
+    if len(strange) == 1:
+        hexish = hexish.replace(strange.pop(), "")
     if len(hexish) == KEY_BYTES * 2:
         try:
             bytes.fromhex(hexish)
@@ -433,11 +439,24 @@ def renders_key_bytes(value: str) -> bool:
                 return True
         except (ValueError, TypeError):
             continue
-    try:
-        if len(base64.a85decode(compact, adobe=True)) == KEY_BYTES:
-            return True
-    except (ValueError, TypeError):
-        pass
+    # a85 has TWO flags, not one: foldspaces spells four spaces as "y", so 32 spaces
+    # are eight characters and no run test will ever see them. And z85 arrived in
+    # 3.13, which this package supports — a decoder that exists on the interpreter
+    # the caller is running is part of "what the standard library produces", whatever
+    # the interpreter I happen to be testing on has.
+    for attempt in (
+        lambda text: base64.a85decode(text, adobe=True),
+        lambda text: base64.a85decode(text, foldspaces=True),
+        lambda text: base64.a85decode(text, adobe=True, foldspaces=True),
+        getattr(base64, "z85decode", None),
+    ):
+        if attempt is None:
+            continue
+        try:
+            if len(attempt(compact)) == KEY_BYTES:
+                return True
+        except (ValueError, TypeError):
+            continue
 
     return False
 
@@ -855,6 +874,10 @@ PATH_RUN = 32
 #: rather than written, because 43 is the sort of number that gets typed once and
 #: then disagreed with.
 KEY_TEXT_LENGTH = -(-KEY_BYTES * 4 // 3)
+
+#: The characters a hex dump is made of, so that everything else in one is its
+#: separator.
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 #: A component that is nothing but key alphabet — no dot, no space, no extension.
 _EVENLY_CHUNKED = re.compile(r"[A-Za-z0-9_-]+")
