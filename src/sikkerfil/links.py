@@ -376,7 +376,12 @@ def _is_a_key_spelled_with_slashes(value: str) -> bool:
     separator as a key character somewhere, and every version of that I could measure
     costs more paths than it is worth.
     """
-    return len(value) == KEY_TEXT_LENGTH and looks_like_a_key(_aliased(value))
+    # PADDING FIRST, because canonical standard base64 of 32 bytes is FORTY-FOUR
+    # characters: b64encode ends it with "=". I measured the anchor against a
+    # spelling I had written myself with .rstrip("="), so the one the standard
+    # library actually produces was a character too long and walked past the check.
+    compact = value.rstrip("=")
+    return len(compact) == KEY_TEXT_LENGTH and looks_like_a_key(_aliased(compact))
 
 
 def redacted_path(path: str) -> str:

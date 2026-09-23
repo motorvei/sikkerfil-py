@@ -1153,11 +1153,25 @@ def test_a_key_spelled_in_standard_base64_is_caught_however_it_falls() -> None:
         ("A" * 10 + "/") * 3 + "A" * 10,
         base64.b64encode(bytes(range(32))).decode().rstrip("="),
         base64.b64encode(bytes(range(200, 232))).decode().rstrip("="),
+        # PADDED, WHICH IS THE CANONICAL FORM AND THE ONE I MISSED. b64encode ends a
+        # 32-byte key with "=", so the spelling the standard library actually
+        # produces is FORTY-FOUR characters — and I had measured the anchor against a
+        # spelling I wrote myself with .rstrip("=") on the end of it.
+        "A" * 20 + "/" + "A" * 6 + "/" + "A" * 15 + "=",
+        ("A" * 10 + "+") * 3 + "A" * 10 + "=",
+        base64.b64encode(bytes(range(32))).decode(),
+        base64.b64encode(bytes(range(60, 92))).decode(),
     ]
     for spelling in spellings:
-        assert len(spelling) == 43, spelling
+        assert len(spelling.rstrip("=")) == 43, spelling
         assert path_carries_key_material(spelling), spelling
-        assert redacted_path(spelling) == "<43 characters, not repeated>"
+        assert redacted_path(spelling) == f"<{len(spelling)} characters, not repeated>"
+
+    # THE DOCUMENTED GAP, asserted so that it stays a decision rather than becoming a
+    # surprise: the same spelling nested inside a longer path is NOT caught, because
+    # every anchor that catches it reads ordinary separators as key characters and
+    # costs between 7.7% and 50% of the real paths on this machine.
+    assert not path_carries_key_material("./" + spellings[0])
 
     # THE COST, MEASURED AND ACCEPTED: a path that is exactly 43 characters with no
     # dot in it loses its name in a "no such file" message. 0.18% of the real paths
