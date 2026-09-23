@@ -101,7 +101,7 @@ def parse_link(link: str) -> ParsedLink:
         ) from None
 
     if parts.scheme not in ("https", "http"):
-        raise ConfigurationError(f"a share link must be https; got {parts.scheme!r}")
+        raise ConfigurationError(f"a share link must be https; got {_quoted(parts.scheme)}")
     origin = f"{parts.scheme}://{parts.netloc}"
     key = _key_from_fragment(parts.fragment)
 
@@ -109,7 +109,10 @@ def parse_link(link: str) -> ParsedLink:
     if path.startswith("s/"):
         candidate = path[2:]
         if not SHARE_ID.match(candidate):
-            raise ConfigurationError(f"{candidate!r} is not a share id")
+            # A KEY PASTED WHERE THE ID GOES, on the canonical share path. This
+            # echoed the candidate, so the most ordinary link shape there is was
+            # the one that reproduced a key in full.
+            raise ConfigurationError(f"{_describe(candidate)}. A share id is {SHARE_ID.pattern}")
         return ParsedLink(origin=origin, share_id=candidate, name=None, key=key)
 
     if SHARE_ID.match(path):
@@ -145,13 +148,25 @@ def build_link(origin: str, reference: str, key: str | bytes) -> str:
 
 
 def base_url_for(market: str) -> str:
-    """The front door for a market code (``no``, ``se``, ``dk``)."""
-    try:
-        return MARKETS[market.strip().lower()]
-    except KeyError:
+    """The front door for a market code (``no``, ``se``, ``dk``).
+
+    LOOKED UP WITH .get() RATHER THAN CAUGHT, because a KeyError carries the key it
+    failed on. This raised ConfigurationError ``from None`` with the value not
+    echoed, and the message was clean — but the KeyError stayed on
+    ``__context__`` holding the market string, which is a decryption key if that
+    is what the caller passed. __suppress_context__ keeps it out of a formatted
+    traceback; it does not keep it off the object, and error trackers walk chains.
+
+    Not caught at all means nothing to leak. Found by making the leak check
+    case-insensitive: the lookup lowercases, so the KeyError held a lowercased key
+    and an exact-match check could not see it.
+    """
+    origin = MARKETS.get(market.strip().lower())
+    if origin is None:
         raise ConfigurationError(
-            f"unknown market {market!r}; expected one of {', '.join(sorted(MARKETS))}"
-        ) from None
+            f"unknown market {_quoted(market)}; expected one of {', '.join(sorted(MARKETS))}"
+        )
+    return origin
 
 
 def _key_from_fragment(fragment: str) -> str | None:
@@ -180,15 +195,22 @@ def origin_of(link: str) -> str:
     returned the entire link for a NAMED share, fragment and all.
 
     urlsplit knows where an authority ends. ``hostname`` rather than ``netloc``,
-    because netloc carries ``user:password@``. The port stays: it is not a secret,
+    because netloc carries ``user:password@``. The port stays: a port is digits,
     and a stub or a self-hosted origin needs it to be recognisable.
+
+    AND THE HOST ITSELF IS NOT TRUSTED, which is the part I had wrong. I wrote
+    down that a hostname is never a secret. Then ``https://<key>/A/B`` — a key
+    pasted where the whole address goes — puts the key in the authority, and
+    ``hostname`` lowercasing it does not make it safe: a 32-byte key can be spelled
+    entirely in lowercase base64url, and a mangled key still gives away nearly all
+    of it. So a host that could be a key is not returned at all.
     """
     try:
         parts = urlsplit(link)
         host, port = parts.hostname, parts.port
     except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
         return ""
-    if not parts.scheme or not host:
+    if not parts.scheme or not host or _looks_like_a_key(host):
         return ""
     return f"{parts.scheme}://{host}{f':{port}' if port else ''}"
 
@@ -228,6 +250,23 @@ def _describe(value: str) -> str:
             "in a link. It is not repeated here, because it is a secret"
         )
     return f"a {len(value)}-character value that is not repeated here, in case it is a key"
+
+
+def _quoted(value: str) -> str:
+    """``repr(value)`` — unless it might be a key, in which case it is not echoed.
+
+    THE RULE, APPLIED WITHOUT EXCEPTION rather than site by site. Four reviews in
+    a row found a component of a link I had decided was safe to print: the
+    fragment, then the path, then the id under ``/s/``, then the HOST. Each
+    judgement was defensible on its own and each was wrong, and the last one
+    defeated an argument I had actually written down — that a hostname is never a
+    secret.
+
+    So there are no judgements left. Anything from the caller goes through here,
+    and anything key-shaped does not come out. Guessing which slots a key can
+    reach has now failed four times; refusing to echo one from any slot cannot.
+    """
+    return "<a key, not repeated here>" if _looks_like_a_key(value) else repr(value)
 
 
 def _looks_like_a_key(value: str) -> bool:

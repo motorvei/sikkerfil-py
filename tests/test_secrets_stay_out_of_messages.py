@@ -25,6 +25,7 @@ import pytest
 
 from sikkerfil import Sikkerfil, build_link, crypto, inspect, parse_link, receive
 from sikkerfil.errors import SikkerfilError
+from sikkerfil.links import base_url_for
 
 #: A real key, so a leak is unambiguous rather than a coincidental substring.
 SECRET = crypto.b64url_encode(bytes(range(4, 36)))
@@ -44,8 +45,19 @@ def _leaks(message: str) -> bool:
     42 of 43, with one 64-way guess left, and that version could not see it. A
     security test that overstates what it checks is worse than one that does
     less and says so.
+
+    AND CASE-INSENSITIVELY, which the second version still got wrong. urlsplit's
+    ``hostname`` lowercases, so when a key reached a message through the authority
+    this could not see it: the runs were there, in the wrong case. A lowercased key
+    is not a redacted key — it gives away everything but the capitalisation, and
+    guessing that offline against a downloaded ciphertext is a couple of billion
+    tries, not a wall. Anything that mangles a key on the way into a message still
+    counts as leaking it.
     """
-    return any(SECRET[i : i + RUN] in message for i in range(len(SECRET) - RUN + 1))
+    haystack = message.lower()
+    return any(
+        SECRET[i : i + RUN].lower() in haystack for i in range(len(SECRET) - RUN + 1)
+    )
 
 
 def _broken_things_holding_a_real_key() -> list[tuple[str, Callable[[], object]]]:
@@ -68,6 +80,14 @@ def _broken_things_holding_a_real_key() -> list[tuple[str, Callable[[], object]]
         ("parse_link: ? instead of #", lambda: parse_link(f"https://sikkerfil.no?k={SECRET}")),
         ("parse_link: query and fragment", lambda: parse_link(f"https://sikkerfil.no/x?k={SECRET}#k={SECRET}")),
         ("parse_link: a bad IPv6 authority", lambda: parse_link(f"https://[oops/x#k={SECRET}")),
+        # THE CANONICAL SHARE PATH. The shape every recipient sees, and the one my
+        # sweep did not have: /s/ takes its own branch, which echoed the candidate.
+        ("parse_link: the key under /s/", lambda: parse_link(f"https://sikkerfil.no/s/{SECRET}")),
+        # THE KEY AS THE WHOLE ADDRESS, so it lands in the authority. I had written
+        # down that a hostname is never a secret. It is when it is a key.
+        ("parse_link: the key as the host", lambda: parse_link(f"https://{SECRET}/A/B")),
+        ("parse_link: the key as a scheme", lambda: parse_link(f"{SECRET}://x/y")),
+        ("base_url_for: the key as a market", lambda: base_url_for(SECRET)),
         ("parse_link: the key with a newline", lambda: parse_link(SECRET + "\n")),
         ("receive: the bare key", lambda: receive(SECRET)),
         # One character lost or mangled on the way through a mail client.
@@ -257,3 +277,43 @@ def test_the_ordinary_logging_line_does_not_write_the_key() -> None:
     assert "sent SentShare" in written, "the log line did not happen — the test proves nothing"
     assert not _leaks(written), written
     assert "wt_zzz" not in written, written
+
+
+#: A key whose base64url spelling contains NO uppercase at all. Constructed rather
+#: than searched for — about one in ten billion random keys is like this — because
+#: the point it makes is not statistical. ``urlsplit().hostname`` lowercases, and I
+#: had treated that as making a host safe to print. For this key it changes nothing
+#: at all, and for any other it still hands over everything but the capitalisation.
+LOWERCASE_KEY = crypto.key_text("abcdefghijklmnopqrstuvwxyz0123456789-_abcde")
+
+
+def test_the_constructed_lowercase_key_is_really_a_key() -> None:
+    # Otherwise the test below proves nothing: a 43-character string that is not a
+    # valid key would be refused for its length and never reach the host logic.
+    assert LOWERCASE_KEY.lower() == LOWERCASE_KEY
+    assert len(crypto.b64url_decode(LOWERCASE_KEY)) == crypto.KEY_BYTES
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "https://{key}/A/B",  # the key IS the authority
+        "https://sikkerfil.no/s/{key}",  # the canonical share path
+        "https://sikkerfil.no/{key}",  # a named link's slot
+        "https://sikkerfil.no?k={key}",  # '?' where '#' belongs
+        "{key}",  # no scheme at all
+    ],
+)
+def test_a_lowercase_key_is_not_echoed_from_any_slot(shape: str) -> None:
+    """Lowercasing is not redaction, which is the correction this encodes.
+
+    Every slot, with a key that survives being lowercased intact. If any of these
+    regress, the message hands over a working key rather than a mangled one.
+    """
+    with pytest.raises(SikkerfilError) as caught:
+        parse_link(shape.format(key=LOWERCASE_KEY))
+    message = str(caught.value)
+    assert LOWERCASE_KEY not in message, message
+    assert not any(
+        LOWERCASE_KEY[i : i + RUN] in message for i in range(len(LOWERCASE_KEY) - RUN + 1)
+    ), message
