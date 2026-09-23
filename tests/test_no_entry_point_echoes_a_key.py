@@ -33,6 +33,7 @@ import inspect as pyinspect
 import io
 import pathlib
 import typing
+import unicodedata
 import urllib.error
 import urllib.request
 from typing import Any
@@ -70,6 +71,13 @@ KEYS = {
     # a working key. Anything the decoder accepts belongs in this table.
     "spaced between every character": " ".join(BASE),
     "wrapped across two lines": BASE[:20] + "\n" + BASE[20:],
+    # FULLWIDTH, which key_text REFUSES — base64 needs ASCII — and which therefore
+    # looked safe to print by the old reasoning. It NFKC-folds straight back to a
+    # working key, and anybody reading a log can do that fold. "Not a value we would
+    # accept" is not the same as "not a disclosure".
+    "fullwidth transcription": "".join(
+        chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in BASE
+    ),
 }
 
 #: One definition, in the library, of how long a run has to be to matter — so what
@@ -113,6 +121,22 @@ _RETURNS_KEY_MATERIAL = frozenset(
         links.build_link,
     }
 )
+
+
+def _leaks_in(text: str, key: str) -> bool:
+    """Any run of ``key`` in ``text``, in any spelling a reader could undo.
+
+    Compatibility-normalised as well as raw, for the same reason the library's own
+    check is: a fullwidth transcription is not a key the library would accept, and
+    folds back to one in a single call. A hunt that reads only the literal spelling
+    cannot see the disclosure it is looking for.
+    """
+    haystacks = (text.lower(), unicodedata.normalize("NFKC", text).lower())
+    return any(
+        key[i : i + RUN].lower() in haystack
+        for haystack in haystacks
+        for i in range(len(key) - RUN + 1)
+    )
 
 
 def _chain(exc: BaseException) -> str:
@@ -384,7 +408,7 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
                         written = repr(result).lower()
                 written += "\n" + out.getvalue().lower() + err.getvalue().lower()
 
-                if any(key[i : i + RUN].lower() in written for i in range(len(key) - RUN + 1)):
+                if _leaks_in(written, key):
                     leaked.append(f"{label}({parameter}=<{spelling}>)")
 
     # A sweep where nothing refused anything would pass while testing nothing.
@@ -420,7 +444,7 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
         else:
             written = ""
         written += "\n" + out.getvalue().lower() + err.getvalue().lower()
-        if any(key[i : i + RUN].lower() in written for i in range(len(key) - RUN + 1)):
+        if _leaks_in(written, key):
             leaked.append(f"cli.main({argv[0]} …)")
     reached.add("cli.main(argv)")
 

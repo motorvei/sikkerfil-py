@@ -18,6 +18,7 @@ guarantee the key never reaches a request.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -391,17 +392,31 @@ _PATH_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{PATH_RUN},}}")
 
 
 def _run_in(value: str, pattern: re.Pattern[str]) -> bool:
-    """Whether ``pattern`` matches ``value``, or ``value`` with the whitespace out.
+    """Whether ``pattern`` matches any spelling of ``value`` that a reader could undo.
 
-    BOTH SPELLINGS, ALWAYS, because the decoder accepts both. key_text takes a key
-    spelled with spaces between every character or wrapped across two lines, so a
-    run-based check that reads only the raw text sees no run and lets it through.
-    That was one bypass in the value check and then, once that was fixed, exactly
-    the same bypass again in the path check — a key across two lines splits into a
-    twenty and a twenty-three, and neither reaches the path threshold on its own.
-    One helper now, so there is one place to get it right.
+    EVERY SPELLING, because a run check reads characters and a key can be written
+    more ways than one:
+
+    WHITESPACE OUT, because the decoder takes it out. key_text accepts a key spelled
+    with spaces between every character, or wrapped across two lines — deliberately,
+    for keys mangled by a mail client — so a check reading the raw text saw no run
+    and echoed the whole thing. That was one bypass in the value check and then,
+    once fixed, the same bypass again in the path check, where a key across two
+    lines splits into a twenty and a twenty-three.
+
+    AND COMPATIBILITY-NORMALISED, which key_text does NOT accept and which is the
+    point. A fullwidth transcription is refused as a key — base64 needs ASCII — so
+    the old reasoning said it was not a key and could be printed. But it NFKC-folds
+    straight back to a working one, and anybody reading the log can do that fold.
+    "Not a value we would accept" is not the same as "not a disclosure".
     """
-    return bool(pattern.search(value) or pattern.search("".join(value.split())))
+    return any(pattern.search(spelling) for spelling in _spellings(value))
+
+
+def _spellings(value: str) -> tuple[str, ...]:
+    """``value`` as written, with whitespace out, and compatibility-normalised."""
+    folded = unicodedata.normalize("NFKC", value)
+    return (value, "".join(value.split()), folded, "".join(folded.split()))
 
 
 def carries_key_material(value: str) -> bool:
