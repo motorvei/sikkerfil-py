@@ -303,13 +303,40 @@ def origin_of(link: str) -> str:
     if parts.scheme not in ("http", "https") or not host:
         return ""
 
-    decoded = unquote(host)
-    # THE HOSTNAME FLOOR, for the reason written on _uniform_run_carrying_key.
-    if structured_carries_key(decoded.replace(":", ".").split("."), chunk_floor=KEY_RUN):
-        return ""
+    # EVERY SPELLING THE RESOLVER WILL SEE, and IDNA is one this did not have. urllib
+    # encodes a Unicode host with IDNA before it builds the Host header and before it
+    # resolves it, and IDNA does not merely normalise: it DELETES characters. U+00AD
+    # SOFT HYPHEN is one, and NFKC keeps it — so a key with a soft hyphen every ten
+    # characters has no run long enough to see, passes every check here, and
+    # host.encode("idna") is the key again, exactly, on its way to whoever runs the
+    # DNS. Percent-decoding was already here for the same reason: what matters is what
+    # the consumer reads, not what the caller typed.
+    for spelling in _host_spellings(host):
+        # THE HOSTNAME FLOOR, for the reason written on _uniform_run_carrying_key.
+        if structured_carries_key(spelling.replace(":", ".").split("."), chunk_floor=KEY_RUN):
+            return ""
 
     authority = f"[{host}]" if ":" in host else host
     return f"{parts.scheme}://{authority}{f':{port}' if port else ''}"
+
+
+def _host_spellings(host: str) -> tuple[str, ...]:
+    """A hostname as written, percent-decoded, and as IDNA will map it.
+
+    The IDNA form is what the resolver and the Host header actually carry. It is taken
+    defensively: encode("idna") raises for a label that is too long or empty, and a
+    host we cannot map is one we check in the other spellings only.
+    """
+    decoded = unquote(host)
+    spellings = [decoded]
+    for candidate in (host, decoded):
+        try:
+            mapped = candidate.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            continue
+        if mapped not in spellings:
+            spellings.append(mapped)
+    return tuple(spellings)
 
 
 def redacted(link: str) -> str:
@@ -772,6 +799,26 @@ def _components(path: str) -> list[str]:
     return _SEPARATORS.split(path)[::2]
 
 
+def _is_navigation(part: str) -> bool:
+    """Whether a path component is navigation rather than a name.
+
+    ONE DEFINITION, IN ONE PLACE, because three passes had to learn about the empty
+    one separately and the third was found by a review after the other two were fixed.
+    "", "." and ".." are the three: none of them contributes a character to any NAME in
+    the path, so none may break a run of components that a key was cut across.
+
+    ".." IS ONE OF THEM, AND THAT TOOK GETTING RIGHT. My first version left it out on
+    the grounds that it changes the path rather than leaving it alone — which is true
+    of the path and beside the point here. The question these passes ask is whether the
+    TEXT hands over a key, and "<key[:20]>/../<key[20:]>" hands over all forty-three
+    characters to anyone reading the message, whatever the kernel later resolves it to.
+    redacted_path printed that path in full. Measured cost of including it: no path of
+    40,001 on this machine has a ".." component at all.
+    """
+    stripped = part.strip()
+    return not stripped or stripped in (".", "..")
+
+
 def _parts_carrying_key(parts: Sequence[str], *, chunk_floor: int = 4) -> set[int]:
     """Which components could carry key material, AS WRITTEN AND NORMALISED.
 
@@ -848,7 +895,7 @@ def _parts_carrying_key_as_written(parts: Sequence[str], *, chunk_floor: int = 4
     # components that have characters in them.
     rank: dict[int, int] = {}
     for index, part in enumerate(parts):
-        if part:
+        if not _is_navigation(part):
             rank[index] = len(rank)
     by_rank = {rank[index]: index for index in fragments if index in rank}
     for ranks in _contiguous(sorted(by_rank)):
@@ -957,7 +1004,9 @@ def _subsequence_renders_key_strictly(parts: Sequence[str]) -> set[int]:
     # and every start walks to the end again. They are dropped rather than skipped
     # inside the loop, because an empty component cannot be part of a rendering and so
     # cannot belong in the answer either.
-    indexed = [(at, "".join(part.split())) for at, part in enumerate(parts) if part.strip()]
+    indexed = [
+        (at, "".join(part.split())) for at, part in enumerate(parts) if not _is_navigation(part)
+    ]
     suspect: set[int] = set()
     # A WHOLE RENDERING CAN SIT INSIDE ONE COMPONENT, which the join loop below cannot
     # see because it starts at the component AFTER start. "prefix-<32 bytes in dotted
@@ -1030,7 +1079,7 @@ def _uniform_run_carrying_key(parts: Sequence[str], chunk_floor: int = 4) -> set
         # close() below ended the run every time. The fragment pass and the strict scan
         # were taught this last round and this was missed, which is what happens when
         # three places answer the same question separately.
-        if not part:
+        if _is_navigation(part):
             continue
         # THE FLOOR IS FOR STARTING A RUN, NOT FOR ENDING ONE. A remainder can be one
         # character — wrap(key, 20) gives 20/20/3 — so it is asked about as an end
@@ -1300,6 +1349,36 @@ def _run_in(value: str, pattern: re.Pattern[str]) -> bool:
     "Not a value we would accept" is not the same as "not a disclosure".
     """
     return any(pattern.search(spelling) for spelling in _spellings(value))
+
+
+def a_key_hides_in_a_token(token: str) -> bool:
+    """Whether a REGISTERED token — a media type, a header name — carries a key.
+
+    ONE DEFINITION FOR BOTH, because they are the same question and I had answered it
+    twice. A media type's subtype and an HTTP field name are alike in the way that
+    matters: their length is a registry's choice rather than a caller's, so the
+    degenerate length tests have nothing to say about them — they refuse
+    application/tamp-community-update-confirm and
+    x-amz-server-side-encryption-customer-key, both real. What is asked instead is
+    whether the token IS a key, or holds a rendering whose alphabet means something.
+
+    A BOOLEAN, AND THAT IS NOT A DETAIL. My first version of this exported the
+    spellings themselves so client.py could loop over them — and the entry-point sweep
+    failed eleven times in a row, because a public function that takes a key and
+    returns its spellings hands the key straight back. Nothing public here may return
+    a caller's value; it may only answer questions about it.
+
+    ASKED OF EVERY SPELLING, because a consumer normalises: 'note="user:<fullwidth
+    dotted hex>-old"' defeats the whole-value rendering check (the decoration), the
+    containment check (two-character runs) and the strict scan (fullwidth digits are
+    not hex), while NFKC of it is dotted hex.
+    """
+    return any(
+        spells_a_key_exactly(spelling)
+        or renders_key_bytes_strictly(spelling)
+        or renders_key_bytes_strictly_inside(spelling)
+        for spelling in _spellings(token)
+    )
 
 
 def _spellings(value: str) -> tuple[str, ...]:

@@ -279,6 +279,23 @@ class Transport:
             # The gap, named rather than found later: a key with DECORATION on it as a
             # header name — "x-key-<a key>" — is not caught, because catching it means
             # refusing the AWS names above. A bare key is the mistake that happens.
+            # A NAME THAT IS NOT A FIELD NAME IS REFUSED FIRST, and unredacted, which
+            # is two leaks in one. "<a key>:" is not a token, so the predicate below
+            # does not recognise it — and then the value checks interpolate the name
+            # into their message, printing the key locally; with a valid value,
+            # http.client raises ValueError carrying the same name. Neither needed the
+            # decorated-name trade-off to be reopened: a field name is
+            # [!#$%&'*+.^_`|~0-9A-Za-z-]+ by RFC 9110, and anything else was never
+            # going to be sent anyway. Refusing it here, by shape, without repeating
+            # it, closes both without costing a single legitimate header.
+            if not _HTTP_FIELD_NAME.fullmatch(name):
+                raise ConfigurationError(
+                    "a header name given is not a valid HTTP field name. It must be "
+                    "letters, digits or !#$%&'*+-.^_`|~ — no spaces, no colon, no "
+                    "control characters, nothing outside ASCII. The name is not "
+                    "repeated here, because a name this library is handed can be a "
+                    "credential or a decryption key by mistake, and nothing was sent."
+                )
             if _a_key_is_the_header_name(name):
                 raise ConfigurationError(
                     "a header name given carries what looks like a decryption key. A "
@@ -483,6 +500,11 @@ def _retry_after(headers: Mapping[str, str]) -> int:
         return 3600
 
 
+#: An HTTP field name, per RFC 9110's token rule. Anything outside it cannot be sent,
+#: so refusing it here is free — and it must happen before any message repeats it.
+_HTTP_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
 def _a_key_is_the_header_name(name: str) -> bool:
     """Whether an HTTP field name is a key, or holds a rendering with an alphabet.
 
@@ -491,8 +513,4 @@ def _a_key_is_the_header_name(name: str) -> bool:
     characters" and "forty-three characters" say nothing about them. See the comment
     at the call site for the two real header names that proved it.
     """
-    return (
-        links.spells_a_key_exactly(name)
-        or links.renders_key_bytes_strictly(name)
-        or links.renders_key_bytes_strictly_inside(name)
-    )
+    return links.a_key_hides_in_a_token(name)

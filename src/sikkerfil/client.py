@@ -650,11 +650,10 @@ def _a_key_hides_in(token: str) -> bool:
     base85 and pastes it into content_type is not making a mistake this library can
     tell apart from a media type, and pretending otherwise costs values people send.
     """
-    return (
-        links.spells_a_key_exactly(token)
-        or links.renders_key_bytes_strictly(token)
-        or links.renders_key_bytes_strictly_inside(token)
-    )
+    # ONE DEFINITION, IN links, because transport asks the identical question of an
+    # HTTP field name and answering it twice is how the fullwidth transcription got in
+    # for the fourth time. See links.a_key_hides_in_a_token.
+    return links.a_key_hides_in_a_token(token)
 
 
 def _content_type_tokens(value: str) -> list[str]:

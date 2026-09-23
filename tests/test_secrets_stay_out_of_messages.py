@@ -2373,3 +2373,168 @@ def test_z85_does_not_depend_on_the_interpreter() -> None:
     # And the alphabet is the real one: "," and ";" and '"' are not in Z85.
     for outside in (",", ";", '"', "'", "\\", "|", "~", "`", "_"):
         assert outside not in _Z85_ALPHABET, outside
+
+
+# --- Round twenty-six: what the consumer reads, in four more places -------------
+
+
+def test_a_header_name_that_is_not_a_field_name_is_refused_unredacted() -> None:
+    """TWO LEAKS IN ONE, AND NEITHER NEEDED THE DECORATED-NAME TRADE-OFF REOPENED.
+
+    ``<a key>:`` is not a token, so the key-shaped-name predicate does not recognise
+    it — and then the value checks interpolate the name into their message, printing
+    the key locally; with a valid value, http.client raises ValueError carrying the
+    same name. A field name is ``[!#$%&'*+.^_`|~0-9A-Za-z-]+`` by RFC 9110 and
+    anything else could never be sent, so refusing it by shape costs nothing.
+    """
+    from sikkerfil.transport import _HTTP_FIELD_NAME, Transport
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    wide = "".join(chr(ord(c) - 0x21 + 0xFF01) if 0x21 <= ord(c) <= 0x7E else c for c in key)
+    attempted: list[str] = []
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempted.extend(f"{n}: {v}" for n, v in request.header_items())
+        raise urllib.error.URLError("the test does not use the network")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.request, "urlopen", spy)
+        for name in (f"{key}:", f"{key} ", f"{key}\n", wide, f"{key}\t", f"({key})"):
+            for value in ("x", "x\x01y"):
+                with pytest.raises(ConfigurationError) as caught:
+                    Transport("http://127.0.0.1:9", retries=0).get_json(
+                        "/api/v1/health", headers={name: value}
+                    )
+                assert not _leaks(str(caught.value)), str(caught.value)
+                assert wide[:20] not in str(caught.value), str(caught.value)
+    assert not attempted, attempted
+
+    # And every field name a real caller sends is still a field name.
+    for ordinary in (
+        "content-type",
+        "x-request-id",
+        "x-amz-server-side-encryption-customer-key",
+        "If-None-Match",
+        "sec-ch-ua-platform",
+        "x_custom_header",
+    ):
+        assert _HTTP_FIELD_NAME.fullmatch(ordinary), ordinary
+
+
+def test_navigation_components_do_not_break_a_run() -> None:
+    """"", "." AND ".." ARE ALL NAVIGATION, and each pass learned that separately.
+
+    ``Path("/tmp/a//b")`` and ``Path("/tmp/a/./b")`` are both ``/tmp/a/b``, so neither
+    may break a run of components a key was cut across. ``..`` belongs with them for a
+    different reason: it changes what the kernel resolves, but the question here is
+    whether the TEXT hands over a key, and ``<key[:20]>/../<key[20:]>`` hands over all
+    forty-three characters to anyone reading the message. ``redacted_path`` printed
+    that path in full.
+    """
+    import textwrap
+
+    from sikkerfil.links import (
+        joined_path_spells_a_key,
+        path_carries_key_material,
+        redacted_path,
+    )
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for between in ("/", "//", "/./", "/../", "/.//../", "/. /"):
+        spelled = f"/tmp/{key[:20]}{between}{key[20:]}"
+        assert path_carries_key_material(spelled), between
+        assert not _leaks(redacted_path(spelled)), between
+    for width in (10, 15, 20):
+        for separator in ("/./", "/../", "//"):
+            chunked = "/tmp/" + separator.join(textwrap.wrap(key, width))
+            assert path_carries_key_material(chunked), (width, separator)
+    assert joined_path_spells_a_key(f"/tmp/{key[:21]}/./{key[21:]}")
+
+    # The paths a caller actually types are untouched: no path of 40,001 on this
+    # machine has a ".." component at all, and these still print in full.
+    for ordinary in (
+        "./rapport.pdf",
+        "../Downloads/kvartalsrapport-2026-q3-endelig.pdf",
+        "/home/me/work/../Downloads/rapport.pdf",
+        "/home/me/./Documents/rapport.pdf",
+        "../../shared/rapporter/q3.pdf",
+    ):
+        assert not path_carries_key_material(ordinary), ordinary
+        assert redacted_path(ordinary) == ordinary, ordinary
+
+    # NOT A COST OF THIS CHANGE, and it took a failing assertion of mine to check
+    # rather than assume: "../Downloads/kvartalsrapport-2026-q3.pdf" IS refused, and
+    # was before this round too. It is exactly forty characters, so the whole-path
+    # base85 test claims it — the same 40/41/43 class as the passphrase refusals, one
+    # more place it shows up, and still the open question rather than a regression.
+    forty = "../Downloads/kvartalsrapport-2026-q3.pdf"
+    assert len(forty) == 40
+    assert path_carries_key_material(forty)
+
+
+def test_a_hostname_is_read_as_idna_will_map_it() -> None:
+    """IDNA DELETES CHARACTERS, and NFKC keeps them.
+
+    U+00AD SOFT HYPHEN is one. A key with one every ten characters has no run long
+    enough for any check here to see, and ``host.encode("idna")`` is the key again,
+    exactly — on its way into the Host header and to whoever runs the DNS. Percent
+    decoding was already here for the same reason: what matters is what the consumer
+    reads, not what the caller typed.
+    """
+    from sikkerfil.links import origin_of
+
+    lowercase = crypto.key_text("a" * 42 + "g")
+    for every in (5, 10, 15):
+        host = "".join(
+            c + "­" if i % every == every - 1 else c for i, c in enumerate(lowercase)
+        )
+        assert host.encode("idna").decode("ascii") == lowercase, every
+        assert origin_of(f"https://{host}/x") == "", every
+
+    # AND EVERY ORIGIN A REAL DEPLOYMENT USES, including one already in punycode.
+    for host in (
+        "sikkerfil.no",
+        "sakerfil.se",
+        "sikkerfil.dk",
+        "bedrift.sikkerfil.no",
+        "my-company-files.example.com",
+        "private.secure.files.company.internal.example.com",
+        "xn--sikkerfil-0za.no",
+        "localhost",
+        "127.0.0.1",
+    ):
+        assert origin_of(f"https://{host}/x") == f"https://{host}", host
+
+
+def test_a_media_type_token_is_read_in_every_spelling() -> None:
+    """The strict scan read the token as written, and NFKC is what a consumer applies.
+
+    ``note="user:<fullwidth dotted hex>-old"`` defeats all three checks at once: the
+    parameter-wide rendering check normalises but wants the WHOLE value, ``holds_a_key``
+    sees two-character runs, and the strict-inside scan looks at fullwidth digits and
+    finds no hex.
+    """
+    import base64
+
+    from sikkerfil.client import _is_a_content_type
+
+    raw = bytes(range(32))
+
+    def fullwidth(text: str) -> str:
+        return "".join(
+            chr(ord(c) - 0x21 + 0xFF01) if 0x21 <= ord(c) <= 0x7E else c for c in text
+        )
+
+    for rendering in (raw.hex("."), raw.hex(":"), raw.hex(), base64.b32encode(raw).decode()):
+        wide = fullwidth(rendering)
+        for shape in (f'text/plain; note="user:{wide}-old"', f'text/plain; note="{wide}"'):
+            assert not _is_a_content_type(shape), rendering[:20]
+
+    for ordinary in (
+        "text/plain; charset=utf-8",
+        'text/csv; charset="utf-8"',
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+        "application/tamp-community-update-confirm",
+        'application/octet-stream; name="kvartalsrapport-2026-q3.pdf"',
+    ):
+        assert _is_a_content_type(ordinary), ordinary
