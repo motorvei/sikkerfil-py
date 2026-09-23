@@ -14,6 +14,8 @@ it, because the whole value of the note is that it fires at the right moment.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 
 import pytest
@@ -170,3 +172,31 @@ def test_an_explicit_base_url_beats_the_links_own_origin(env, capsys) -> None:
     reached = [r.path for r in env.requests]
     assert reached, "the request did not go to the stub — it went somewhere else"
     assert reached[-1] == f"{API_PREFIX}/shares/NOSUCH01"
+
+
+def test_every_parser_in_the_cli_redacts_by_identity() -> None:
+    """THE FUNNEL, ON EACH PARSER — not only on the one a test happens to reach.
+
+    The redaction lives in ``error()`` precisely so that nobody has to enumerate
+    which argparse messages carry a caller's value. Handing the argv to the top
+    parser and not to the subparsers would put the enumeration back: a subparser's
+    refusal would fall through to the pattern backstop, which by design cannot see a
+    key that has been spaced out.
+
+    So each parser is asked to refuse, with the message argparse would write, and
+    each must come back with nothing of the value in it.
+    """
+    from sikkerfil import cli, crypto
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    spaced = " ".join(key[:-1])
+
+    parser = cli._parser_for([spaced])
+    found = cli.parsers(parser)
+    assert len(found) >= 7, f"only {len(found)} parsers found — the walk is broken"
+    for each in found:
+        err = io.StringIO()
+        with contextlib.suppress(SystemExit), contextlib.redirect_stderr(err):
+            each.error(f"argument command: invalid choice: {spaced!r}")
+        folded = "".join(err.getvalue().split())
+        assert key[:30] not in folded, f"{each.prog}: {err.getvalue()}"

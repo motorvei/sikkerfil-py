@@ -76,15 +76,35 @@ class _Parser(argparse.ArgumentParser):
     I fixed this option by option twice and a third slot was still open.
 
     Subparsers inherit this class, because add_subparsers defaults parser_class to
-    the type of the parser it is called on.
+    the type of the parser it is called on — and each one is handed the same argv, so
+    a refusal from a subparser can redact by identity too.
     """
+
+    #: The argv this parser was asked to read, so error() can take a value out of a
+    #: message BY IDENTITY rather than by recognising it. " ".join(key) has no run
+    #: for a pattern to find and is not a whole key either; it is, however, exactly
+    #: the string that was passed in.
+    given: Sequence[str] = ()
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        self.exit(2, f"{self.prog}: error: {scrubbed(message)}\n")
+        self.exit(2, f"{self.prog}: error: {scrubbed(message, self.given)}\n")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def parsers(parser: argparse.ArgumentParser) -> list[_Parser]:
+    """``parser`` and every subparser under it."""
+    found = [parser] if isinstance(parser, _Parser) else []
+    # argparse exposes no public walk of its own parsers, so this reads two private
+    # attributes. They have been stable since argparse entered the standard library,
+    # and the alternative is keeping a second list of subparsers in step by hand.
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            found.extend(p for p in action.choices.values() if isinstance(p, _Parser))
+    return found
+
+
+def _parser_for(given: Sequence[str]) -> _Parser:
+    """The whole command line, with ``given`` handed to every parser in it."""
     parser = _Parser(
         prog="sikkerfil",
         description="Encrypted file transfer that stays inside Scandinavia.",
@@ -135,6 +155,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit.add_argument("--write-token", required=True)
     audit.add_argument("--csv", action="store_true", help="the form a DPO files")
 
+    # EVERY PARSER GETS THE SAME argv, the subparsers included. Nothing I could find
+    # makes a SUBparser format a caller value into a message — our own converters
+    # take that job, and they go through quoted() — but the point of putting the
+    # redaction in error() was to stop enumerating which messages carry values, and
+    # leaving one parser out of that would be enumerating again with extra steps.
+    # There is a test that calls error() on each parser in turn, because a property
+    # that holds only where I happened to look is the thing this file keeps proving
+    # wrong.
+    for each in parsers(parser):
+        each.given = list(given)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _parser_for(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
 
     try:

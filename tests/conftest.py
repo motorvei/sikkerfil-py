@@ -8,6 +8,16 @@ transport asserts that we called ourselves the way we expected to call ourselves
 which is exactly the class of bug it cannot see. This runs a real HTTP server on
 a real loopback port and records what actually arrived.
 
+A HAZARD FOR THE WAY THIS SUITE IS USED. Every fix in this repository is checked by
+reverting it and counting the failures, and that method has a way of lying: CPython
+validates a cached ``.pyc`` against the source's mtime in WHOLE SECONDS and its size
+in bytes. Restore a file within the same second as the cache was written, with the
+same size — which "2" changing back from "5" is — and the stale bytecode is loaded,
+so the revert measures the code you thought you put back. It happened once here, and
+the only reason it was caught is that a test failed AFTER the restore. Run these
+checks with ``PYTHONDONTWRITEBYTECODE=1``, and treat a surprising zero as a question
+rather than an answer.
+
 WHAT IT CANNOT PROVE, and the reason ``test_transport.py`` is structural as well:
 there is no CloudFront here. This stub accepts a POST with no
 ``x-amz-content-sha256`` because nothing is signing anything. Production would

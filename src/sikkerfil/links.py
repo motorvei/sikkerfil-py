@@ -470,6 +470,41 @@ def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
             # spaced. The offsets do not survive those transformations, so the whole
             # run is withheld rather than guessed at.
             suspect.update(run)
+
+    # AND THE SEPARATOR ITSELF CAN BE PART OF THE KEY, which the pass above cannot
+    # see. Standard base64 spells with "/", so ("A" * 10 + "/") * 3 + "A" * 10 is a
+    # path of four ten-character components AND a 43-character key once the slashes
+    # are read as underscores — and a key chunked four ways by hand is the same
+    # shape. Neither piece reaches KEY_RUN, so neither is a fragment.
+    #
+    # Reading every path that way is not an option: aliasing the separators of
+    # /home/user/sikkerfil-py/src/sikkerfil/errors.py gives 43 characters of the
+    # alphabet too. Measured over 99,595 real paths on this machine, that reading
+    # redacts HALF of them. What separates the two is uniformity — a key cut into
+    # pieces is cut at a fixed width, by whoever cut it — so a run of neighbouring
+    # components whose lengths are within two of each other is read with its
+    # separators as underscores. Same corpus: 57 of 99,595, 0.06%.
+    suspect |= _uniform_run_carrying_key(parts)
+    return suspect
+
+
+def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
+    """Components of an evenly-chunked run whose separators complete a key."""
+    suspect: set[int] = set()
+    run: list[int] = []
+
+    def close() -> None:
+        if len(run) >= 2 and _holds_a_key("_".join(parts[index] for index in run)):
+            suspect.update(run)
+
+    for index, part in enumerate(parts):
+        even = bool(part) and _EVENLY_CHUNKED.fullmatch(part) and len(part) >= 4
+        if even and (not run or abs(len(part) - len(parts[run[0]])) <= _CHUNK_SLACK):
+            run.append(index)
+            continue
+        close()
+        run = [index] if even else []
+    close()
     return suspect
 
 
@@ -493,7 +528,7 @@ def _holds_a_key(joined: str) -> bool:
     return False
 
 
-def scrubbed(text: str) -> str:
+def scrubbed(text: str, given: Sequence[str] = ()) -> str:
     """A message written by somebody else, with anything key-shaped taken out.
 
     FOR ARGPARSE, WHICH FORMATS ITS OWN REFUSALS AND WRITES THEM ITSELF. "invalid
@@ -505,13 +540,29 @@ def scrubbed(text: str) -> str:
     no way to take ``choices=`` off a subparser: ``sikkerfil <a key>`` is a plausible
     command/link mix-up and printed every character.
 
-    So this handles the class instead: every argparse message goes through here.
-    Runs long enough to be part of a key are replaced by their length; and if any
-    SPELLING of what is left still carries such a run — a fullwidth transcription
-    that NFKC folds back, standard base64's alphabet — the message is dropped
-    entirely rather than printed in the hope that the substitution caught it.
+    So this handles the class instead: every argparse message goes through here, with
+    the argv it was raised about. Three passes, in order of precision: the values
+    themselves are replaced where they appear, then runs long enough to be part of a
+    key, and finally the whole message is dropped if any spelling of what is left
+    still holds a key.
     """
-    cleaned = _PATH_CHARACTERS.sub(lambda m: f"<{len(m.group())} characters>", text)
+    # BY IDENTITY FIRST, because a pattern cannot see a key that has been taken apart.
+    # argparse formats the offending argv element into its message, and " ".join(key)
+    # is forty-two characters with a space between each one: no run for the regex to
+    # find, too short for the whole-key fallback, and deleting the spaces gives back
+    # 252 of the key's 256 bits. But we HAVE the argv this message is about, so the
+    # value does not have to be recognised — it can be matched.
+    #
+    # Both spellings, because %r is how argparse formats a value and a value with a
+    # newline in it appears escaped rather than literal.
+    cleaned = text
+    for value in given:
+        if not value or not opaque_carries_key_material(value):
+            continue
+        placeholder = f"<{len(value)} characters, not repeated>"
+        for spelling in (repr(value), value):
+            cleaned = cleaned.replace(spelling, placeholder)
+    cleaned = _PATH_CHARACTERS.sub(lambda m: f"<{len(m.group())} characters>", cleaned)
     # THE FALLBACK ASKS FOR A WHOLE KEY, not a run, and that is a correction: a run
     # test over the whitespace-folded spelling withheld "the following arguments are
     # required: file", because "thefollowingargumentsarerequired" is thirty-two
@@ -600,6 +651,14 @@ PATH_RUN = 32
 #: rather than written, because 43 is the sort of number that gets typed once and
 #: then disagreed with.
 KEY_TEXT_LENGTH = -(-KEY_BYTES * 4 // 3)
+
+#: A component that is nothing but key alphabet — no dot, no space, no extension.
+_EVENLY_CHUNKED = re.compile(r"[A-Za-z0-9_-]+")
+
+#: How much two pieces of one chunked key may differ in length. Two, because a key
+#: of 43 characters cut in three is 15/15/13 and cut in four is 11/11/11/10. Three
+#: triples the false positives on real paths for nothing this catches.
+_CHUNK_SLACK = 2
 
 _KEY_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{KEY_RUN},}}")
 _PATH_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{PATH_RUN},}}")

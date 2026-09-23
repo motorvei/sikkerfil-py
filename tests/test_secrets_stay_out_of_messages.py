@@ -1034,3 +1034,100 @@ def test_argparse_cannot_echo_a_key_from_any_slot() -> None:
     ):
         cli.main(["send"])
     assert "required" in err.getvalue() and "file" in err.getvalue(), err.getvalue()
+
+
+# --- Round fourteen: the space between the characters, and the separator as one --
+
+
+def test_a_spaced_near_key_is_not_printed_by_argparse() -> None:
+    """THE WHOLE-KEY FALLBACK WAS TOO NARROW, and I had just made it that way.
+
+    ``sikkerfil <42 key characters separated by spaces>`` has no run for the
+    substitution to find and is not a whole key either, so the message printed every
+    character; deleting the spaces gives back 252 of the key's 256 bits.
+
+    The fix is not a better pattern. argparse is refusing an argv element we are
+    holding, so the value does not have to be RECOGNISED — it can be matched. What
+    remains pattern-based is only the backstop for a value we were not given.
+    """
+    from sikkerfil import cli
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for spelling in (
+        " ".join(key[:-1]),  # 42 characters, spaced
+        " ".join(key),
+        key[:21] + "\n" + key[21:],  # wrapped, so argparse escapes it in %r
+        key[:-1],
+        key[:36],
+    ):
+        err = io.StringIO()
+        with (
+            contextlib.suppress(BaseException),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.main([spelling])
+        folded = "".join(err.getvalue().split())
+        for length in (43, 42, 36, 30, 24):
+            assert key[:length] not in folded, err.getvalue()
+
+    # The same value in an option slot, not only the subcommand one.
+    for argv in (
+        ["--market", " ".join(key[:-1]), "list"],
+        ["send", "r.pdf", "--max-downloads", " ".join(key[:-1])],
+        ["send", "r.pdf", "--expires", " ".join(key[:-1])],
+    ):
+        err = io.StringIO()
+        with (
+            contextlib.suppress(BaseException),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.main(argv)
+        assert key[:30] not in "".join(err.getvalue().split()), err.getvalue()
+
+
+def test_a_key_chunked_across_path_components_is_caught() -> None:
+    """THE SEPARATOR CAN BE PART OF THE KEY, which the join pass cannot see.
+
+    Standard base64 spells with "/", so ``("A" * 10 + "/") * 3 + "A" * 10`` is four
+    ten-character path components AND a 43-character key once the slashes are read as
+    underscores. A key cut into four pieces by hand is the same shape. Neither piece
+    reaches KEY_RUN, so neither is a fragment and the join pass never ran.
+
+    Reading every path that way redacts half of them — aliasing the separators of
+    this repository's own source files produces 43 characters of the alphabet too.
+    What separates them is uniformity: a key cut into pieces is cut at a fixed width.
+    """
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    chunked = [
+        ("A" * 10 + "/") * 3 + "A" * 10,
+        "/".join([key[:11], key[11:22], key[22:33], key[33:]]),
+        "/".join([key[:15], key[15:30], key[30:]]),
+        "\\".join([key[:11], key[11:22], key[22:33], key[33:]]),
+        "/".join(key[i : i + 9] for i in range(0, 43, 9)),
+    ]
+    for value in chunked:
+        assert path_carries_key_material(value), value
+        assert not _leaks(redacted_path(value)), redacted_path(value)
+        assert not _leaks(redacted_path(value).replace("/", "_").replace("\\", "_"))
+
+    # AND THE PATHS THIS MUST NOT EAT. Measured over 99,595 real paths on the machine
+    # this was written on, the rule redacts 0.06% of them; aliasing every separator
+    # unconditionally redacts 50%, this repository's own modules among them.
+    for ordinary in (
+        "/home/user/sikkerfil-py/src/sikkerfil/errors.py",
+        "/home/me/Documents/work/2026/rapporter/kvartal/q3/final",
+        "/tmp/pytest-of-user/pytest-63/test_a_key_pasted_with_whi0/rapport.pdf",
+        "C:\\Users\\me\\Documents\\kvartal-2026-q3.xlsx",
+        "/var/folders/9z/abcdefgh/T/tmp1234/rapport.pdf",
+        # THIS ONE PINS THE SLACK. dist-packages/setuptools/_distutils/__pycache__
+        # is 13/10/11/11 — four evenly-ish sized components of pure alphabet that
+        # join past 43 characters — so it is redacted the moment the tolerance goes
+        # to three, and it is an ordinary path on any machine with setuptools on it.
+        "/usr/lib/python3/dist-packages/setuptools/_distutils/__pycache__/_log.cpython-312.pyc",
+    ):
+        assert not path_carries_key_material(ordinary), ordinary
+        assert redacted_path(ordinary) == ordinary
