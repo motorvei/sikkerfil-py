@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from sikkerfil import build_link, parse_link
+from sikkerfil import build_link, crypto, parse_link
 from sikkerfil.errors import ConfigurationError
 
 KEY = "KDYNXg9NDnXp7tQnjkL4LI_ppByM-QcOIHsUKfuN3u4"
@@ -101,3 +101,49 @@ def test_the_link_is_built_from_the_senders_own_market() -> None:
     # A Danish customer's recipients must not be sent to a domain they have
     # never heard of. The origin in, the origin out.
     assert build_link("https://sikkerfil.dk", "ABCD1234", KEY).startswith("https://sikkerfil.dk/")
+
+
+def test_a_link_built_from_the_raw_key_bytes_is_still_a_working_link() -> None:
+    # FOUND BY USING THE LIBRARY, not by reading it. new_key() and Sealed.key are
+    # bytes; build_link's key is the base64url text. Hand it the bytes you have —
+    # the obvious mistake, because it is the only key value in scope — and the old
+    # version interpolated their repr:
+    #
+    #     https://sikkerfil.dk/s/ABCD1234#k=b'\x9c\x1f...
+    #
+    # Right shape, right length, opens for nobody. Nothing on the sending side
+    # could tell; the recipient found out instead.
+    raw = crypto.b64url_decode(KEY)
+    assert build_link("https://sikkerfil.no", "ABCD1234", raw) == (
+        f"https://sikkerfil.no/s/ABCD1234#k={KEY}"
+    )
+    assert parse_link(build_link("https://sikkerfil.no", "ABCD1234", raw)).key == KEY
+
+
+def test_padding_from_a_config_file_does_not_reach_the_fragment() -> None:
+    # '=' in a fragment is legal and gets helpfully escaped by things that rewrite
+    # links, which is why the browser writes unpadded. A key read back out of a
+    # file or a shell variable may have kept its padding.
+    assert build_link("https://sakerfil.se", "ABCD1234", KEY + "=") == (
+        f"https://sakerfil.se/s/ABCD1234#k={KEY}"
+    )
+
+
+@pytest.mark.parametrize(
+    "not_a_key",
+    [
+        "",  # nothing at all
+        "abc",  # decodes, but to two bytes
+        "æøå",  # not even ASCII
+        KEY[:-4],  # a key with the end lost in a mail client
+        b"\x00" * 16,  # half a key, as bytes
+        KEY.encode("ascii"),  # the TEXT as bytes: 43 bytes, not 32
+    ],
+)
+def test_a_key_that_cannot_open_anything_is_refused_rather_than_published(
+    not_a_key: str | bytes,
+) -> None:
+    # A link is handed to someone else. By the time it fails it is in their inbox
+    # and the file is already uploaded, so the cheap place to fail is here.
+    with pytest.raises(ConfigurationError):
+        build_link("https://sikkerfil.no", "ABCD1234", not_a_key)
