@@ -19,7 +19,14 @@ import json
 import pytest
 
 from sikkerfil.cli import duration, main
+from sikkerfil.crypto import KEY_BYTES, b64url_encode
 from sikkerfil.transport import API_PREFIX
+
+#: A key of the real size. "abc" used to do for tests that never decrypt
+#: anything, but receive() now refuses a key that cannot open a file BEFORE it
+#: makes any request — so a placeholder short-circuits the very thing under test
+#: and the test passes for the wrong reason.
+A_KEY = b64url_encode(bytes(range(KEY_BYTES)))
 
 
 @pytest.fixture
@@ -143,7 +150,9 @@ def test_list_revoke_and_audit(env, tmp_path, capsys) -> None:
 
 def test_a_service_error_is_one_line_on_stderr_not_a_traceback(env, capsys) -> None:
     # A stack trace in a terminal tells the user we did not anticipate this.
-    assert main(["receive", "https://sikkerfil.no/s/NOSUCH01#k=abc"]) == 1
+    # The key has to be a real one or this never reaches the service and ends up
+    # asserting about a local key error instead — passing, and testing nothing.
+    assert main(["receive", f"https://sikkerfil.no/s/NOSUCH01#k={A_KEY}"]) == 1
     err = capsys.readouterr().err
     assert "sikkerfil:" in err
     assert "Traceback" not in err
@@ -157,7 +166,7 @@ def test_an_explicit_base_url_beats_the_links_own_origin(env, capsys) -> None:
     a test suite quietly starts depending on someone else's uptime, and how a
     developer pointed at staging ends up writing to production.
     """
-    main(["receive", "https://sikkerfil.no/s/NOSUCH01#k=abc"])
+    main(["receive", f"https://sikkerfil.no/s/NOSUCH01#k={A_KEY}"])
     reached = [r.path for r in env.requests]
     assert reached, "the request did not go to the stub — it went somewhere else"
     assert reached[-1] == f"{API_PREFIX}/shares/NOSUCH01"

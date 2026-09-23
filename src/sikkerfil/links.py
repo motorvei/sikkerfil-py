@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
-from .crypto import KEY_BYTES, b64url_decode, b64url_encode
+from .crypto import key_text
 from .errors import ConfigurationError
 
 #: The service's own id alphabet — uppercase and digits, 4 to 32 characters.
@@ -122,13 +122,13 @@ def build_link(origin: str, reference: str, key: str | bytes) -> str:
     :attr:`~sikkerfil.crypto.Sealed.key_text` gives you, or the raw 32 bytes from
     :attr:`~sikkerfil.crypto.Sealed.key` and :func:`~sikkerfil.crypto.new_key`.
     Both are accepted because a caller holding one and needing the other cannot
-    tell from the failure: see :func:`_key_text`.
+    tell from the failure: see :func:`~sikkerfil.crypto.key_text`.
     """
     # An id lives under /s/; a claimed name lives at the root, which is why
     # names.ts keeps a reserved list — a name is in the same namespace as the
     # site's own routes.
     path = f"s/{reference}" if SHARE_ID.match(reference) else reference
-    return f"{origin.rstrip('/')}/{path}#k={_key_text(key)}"
+    return f"{origin.rstrip('/')}/{path}#k={key_text(key)}"
 
 
 def base_url_for(market: str) -> str:
@@ -155,38 +155,3 @@ def _key_from_fragment(fragment: str) -> str | None:
         if sep and name == "k":
             return unquote(value) or None
     return unquote(fragment) or None
-
-
-def _key_text(key: str | bytes) -> str:
-    """The key as it must appear after ``#k=``, from either spelling of it.
-
-    THE FAILURE THIS EXISTS TO PREVENT IS SILENT. ``new_key()`` and ``Sealed.key``
-    are bytes; the link wants base64url text. Interpolating the bytes you have
-    yields ``#k=b'\\x9c\\x1f...'`` — a link of plausible length that no
-    recipient can open, and nothing on the sending side ever finds out. So bytes
-    are encoded rather than repr'd, and text is checked for being a key at all.
-
-    Refusing here is cheap. The alternative is a recipient with an undecryptable
-    file and a sender with no way to tell which of the two ends was wrong.
-    """
-    if isinstance(key, (bytes, bytearray, memoryview)):
-        raw = bytes(key)
-    else:
-        try:
-            raw = b64url_decode(key)
-        # Both spellings of "not base64url" land here: binascii.Error for bad
-        # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
-        except (TypeError, ValueError):
-            raise ConfigurationError(
-                f"the key in a link is base64url text; {key!r} is not. It is what "
-                "Sealed.key_text gives you, or the part after #k= in another link."
-            ) from None
-    if len(raw) != KEY_BYTES:
-        raise ConfigurationError(
-            f"a sikkerfil key is {KEY_BYTES} bytes ({KEY_BYTES * 8}-bit AES); this "
-            f"one is {len(raw)}. A link built from the wrong value looks right and "
-            "cannot be opened by anyone, so it is refused here instead."
-        )
-    # Re-encoded rather than passed through, so a padded key from a config file
-    # does not become a link with '=' in the fragment.
-    return b64url_encode(raw)

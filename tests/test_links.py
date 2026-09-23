@@ -147,3 +147,12 @@ def test_a_key_that_cannot_open_anything_is_refused_rather_than_published(
     # and the file is already uploaded, so the cheap place to fail is here.
     with pytest.raises(ConfigurationError):
         build_link("https://sikkerfil.no", "ABCD1234", not_a_key)
+
+
+def test_any_bytes_like_spelling_of_the_key_normalises() -> None:
+    # key_text does the widening for the whole library, so it takes bytes-like
+    # rather than only bytes. The public callers advertise str | bytes, which are
+    # the two spellings anybody actually holds.
+    raw = crypto.b64url_decode(KEY)
+    assert crypto.key_text(bytearray(raw)) == KEY
+    assert crypto.key_text(memoryview(raw)) == KEY

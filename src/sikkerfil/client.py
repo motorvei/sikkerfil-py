@@ -215,7 +215,7 @@ class Sikkerfil:
         link: str,
         *,
         password: str | None = None,
-        key: str | None = None,
+        key: str | bytes | None = None,
     ) -> ReceivedFile:
         """Download and decrypt.
 
@@ -243,17 +243,23 @@ class Sikkerfil:
         """
         parsed = parse_link(link)
 
+        # CANONICALISE BEFORE COMPARING. A key arrives as base64url text or as the
+        # raw bytes crypto hands back, and a fragment may keep its padding or not.
+        # Comparing the spellings instead of the keys reports one key as two.
+        given = crypto.key_text(key) if key else None
+        in_link = crypto.key_text(parsed.key) if parsed.key else None
+
         # BOTH, AND DISAGREEING, is not something to resolve by precedence. One
         # of them opens the file and the other does not, and picking silently
         # means the caller debugs a decryption failure rather than a typo.
-        if key and parsed.key and key.strip() != parsed.key:
+        if given and in_link and given != in_link:
             raise ConfigurationError(
                 "two different keys: one in the link's '#k=' fragment and one in "
                 "key=. Pass the link on its own, or the id with key=, but not a "
                 "link whose fragment contradicts the argument."
             )
 
-        secret = (key or parsed.key or "").strip()
+        secret = given or in_link or ""
         if not secret:
             raise ConfigurationError(
                 f"no decryption key for {parsed.reference or link!r}. The key is "
@@ -377,7 +383,7 @@ def receive(
     link: str,
     *,
     password: str | None = None,
-    key: str | None = None,
+    key: str | bytes | None = None,
     market: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> ReceivedFile:

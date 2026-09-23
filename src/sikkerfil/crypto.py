@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .errors import DecryptionError
+from .errors import ConfigurationError, DecryptionError
 
 #: AES-256. The browser generates the same length and there is no negotiation.
 KEY_BYTES = 32
@@ -73,6 +73,53 @@ def b64url_decode(text: str) -> bytes:
     """
     padded = text + "=" * (-len(text) % 4)
     return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def key_text(key: str | bytes | bytearray | memoryview) -> str:
+    """One key, canonically spelled: unpadded base64url, as it appears after ``#k=``.
+
+    THE SAME KEY HAS THREE SPELLINGS and callers hold whichever one they were
+    handed. ``new_key()`` and ``Sealed.key`` are raw bytes; ``Sealed.key_text``
+    and a link fragment are base64url text; a key read back out of a config file
+    or a shell variable may have kept its ``=`` padding. They are one key, and
+    anything comparing or publishing them must agree on that.
+
+    WHAT GOES WRONG WITHOUT THIS IS NOT A CRASH. Interpolate the bytes you have
+    into a link and you get ``#k=b'\\x9c\\x1f...'`` — plausible length, opens for
+    nobody, and the sending side never finds out. Compare the spellings instead of
+    the keys and one key reads as two, so a caller passing a correct key is told
+    it contradicts itself.
+
+    So: bytes are encoded rather than repr'd, padding is dropped, and anything
+    that is not a key is refused by name.
+
+    This signature is wider than the public API's ``str | bytes``, because this is
+    where the widening happens — the callers advertise the two spellings anybody
+    actually holds.
+    """
+    if isinstance(key, (bytes, bytearray, memoryview)):
+        raw = bytes(key)
+    else:
+        try:
+            raw = b64url_decode(key)
+        # Both spellings of "not base64url" land here: binascii.Error for bad
+        # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
+        except (TypeError, ValueError):
+            raise ConfigurationError(
+                f"a sikkerfil key is base64url text or 32 raw bytes; {key!r} is "
+                "neither. The text is what Sealed.key_text gives you, and what "
+                "follows #k= in a share link."
+            ) from None
+    if len(raw) != KEY_BYTES:
+        raise ConfigurationError(
+            f"a sikkerfil key is {KEY_BYTES} bytes ({KEY_BYTES * 8}-bit AES); this "
+            f"one is {len(raw)}. Something this size opens nothing, so it is "
+            "refused before it becomes a link or a download."
+        )
+    # Re-encoded rather than passed through: '=' in a fragment is legal and gets
+    # helpfully escaped by things that rewrite links, and the browser writes
+    # unpadded, so unpadded is the one spelling everything else can be compared to.
+    return b64url_encode(raw)
 
 
 def new_key() -> bytes:

@@ -311,3 +311,53 @@ def test_market_and_base_url_together_is_refused() -> None:
     # ships to the wrong market.
     with pytest.raises(ConfigurationError, match="not both"):
         Sikkerfil(api_key="k", market="se", base_url="https://example.test")
+
+
+def test_the_key_opens_the_file_however_it_is_spelled(client: Sikkerfil, stub) -> None:
+    """One key has three spellings, and a caller holds whichever they were handed.
+
+    ``SentShare.key`` is base64url text, ``Sealed.key`` and ``new_key()`` are raw
+    bytes, and a key that has been through a config file or a shell variable may
+    have kept its ``=`` padding. All three are the same key. Only one of them used
+    to work here.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    raw = crypto.b64url_decode(sent.key)
+
+    for spelling in (sent.key, raw, sent.key + "="):
+        got = client.receive(sent.id, key=spelling)
+        assert got.data == PLAINTEXT, f"{type(spelling).__name__} did not open the file"
+
+
+def test_the_same_key_twice_is_not_two_different_keys(client: Sikkerfil, stub) -> None:
+    """The link's fragment and ``key=`` agreeing must not read as a contradiction.
+
+    The check compared the spellings rather than the keys, so passing the bytes of
+    the very key in the link — or the same text with its padding — was reported as
+    two different keys. A correct caller was told they had made a mistake.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    raw = crypto.b64url_decode(sent.key)
+
+    assert client.receive(sent.url, key=raw).data == PLAINTEXT
+    assert client.receive(sent.url, key=sent.key + "=").data == PLAINTEXT
+
+
+def test_two_genuinely_different_keys_are_still_refused(client: Sikkerfil, stub) -> None:
+    # The check must still do its job: one of them opens the file and the other
+    # does not, and choosing silently means debugging a decryption failure.
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    with pytest.raises(ConfigurationError, match="two different keys"):
+        client.receive(sent.url, key=crypto.new_key())
+
+
+def test_a_key_that_opens_nothing_is_refused_before_any_request(
+    client: Sikkerfil, stub
+) -> None:
+    """It used to reach the service first and then raise TypeError from inside
+    crypto — a traceback about concatenating str to bytes, for a caller who passed
+    a key of the wrong size."""
+    before = len(stub.requests)
+    with pytest.raises(ConfigurationError, match="32 bytes"):
+        client.receive("ABCD1234", key=b"too short")
+    assert len(stub.requests) == before, "it spoke to the service before checking the key"
