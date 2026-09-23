@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import ssl
 import time
 import urllib.error
@@ -63,7 +64,6 @@ from urllib.parse import urlsplit
 
 import certifi
 
-from . import links
 from .errors import (
     ApiError,
     AuthenticationError,
@@ -82,10 +82,41 @@ TOKEN_HEADER = "x-sikkerfil-token"
 #: The digest header the edge requires on every signed POST. See the module docstring.
 DIGEST_HEADER = "x-amz-content-sha256"
 
-#: The headers that carry a credential, and therefore must never carry a key.
-#: Derived from the constants above rather than written out again, so a third
+#: WHAT THE SERVICE ACTUALLY MINTS, read out of its source and not assumed:
+#: ``KEY_PATTERN`` in app/src/key-format.ts and ``WRITE_TOKEN_PATTERN`` in
+#: app/src/ids.ts. Checked POSITIVELY, because the thing being kept off the wire is
+#: a decryption key, and "not a key" is a far weaker statement than "is one of the
+#: two shapes a credential comes in".
+#:
+#: THE ASSUMPTION IS WHY THIS IS WRITTEN OUT WITH ITS SOURCE. The first version of
+#: this check simply required a credential to start with ``sikkerfil_sk_`` or
+#: ``wt_`` — and the service had never minted a ``wt_`` anything. A write token was
+#: ``randomBytes(32).toString("base64url")``, so the check refused EVERY GENUINE
+#: TOKEN: revoke() and audit() would have raised for every real caller on their
+#: first call. Nothing here caught it, because conftest minted ``wt-<id>`` and both
+#: /utviklere and this library's README documented ``wt_…`` — a test double and two
+#: documents agreeing with each other and not with the code that mints the value.
+#:
+#: The service now mints the prefix the documentation promised (sikkerfil#62), and
+#: that is what makes the token shape worth checking: a write token and a
+#: decryption key were previously the SAME SHAPE — 43 characters of base64url,
+#: character for character — so no test of the value could tell them apart, and the
+#: mix-up this guard exists for (revoke(id, write_token=<the key>)) was undecidable
+#: here. With ``wt_`` in front of a real token, a key handed over whole is refused,
+#: and so is every near miss: one character short, still carrying ``=`` padding,
+#: wrapped across two lines, or spelled in standard base64 with ``+/``.
+#:
+#: A token issued before that deploy has no prefix and is refused by name. That is
+#: deliberate rather than overlooked: this library is not published yet, so no
+#: caller holds one, and accepting a bare 43-character value on this header would
+#: mean accepting a decryption key on it — which is the disclosure the whole check
+#: exists to prevent.
+_API_KEY = re.compile(r"sikkerfil_sk_[A-Za-z0-9_-]{43}")
+_WRITE_TOKEN = re.compile(r"wt_[A-Za-z0-9_-]{43}")
+
+#: Keyed on the header constants rather than repeating their spellings, so a third
 #: credential header cannot quietly escape the check.
-_CREDENTIAL_HEADERS = frozenset({KEY_HEADER, TOKEN_HEADER})
+_CREDENTIAL_SHAPES = {KEY_HEADER: _API_KEY, TOKEN_HEADER: _WRITE_TOKEN}
 
 #: The API version every address carries: /api/v1/...
 #:
@@ -218,8 +249,8 @@ class Transport:
         # window produces, came back out inside a stdlib error. It was not even a
         # SikkerfilError, so a caller catching ours never saw it coming.
         #
-        # Every credential this library sends is ASCII by construction — wt_…,
-        # sikkerfil_sk_…, base64url — so a value that is not is a caller mistake,
+        # Every credential this library sends is ASCII by construction —
+        # sikkerfil_sk_… or base64url — so a value that is not is a caller mistake,
         # and it is refused by NAME rather than by value.
         for name, value in headers.items():
             # ASCII IS NOT ENOUGH, which is where the first version of this stopped.
@@ -236,13 +267,21 @@ class Transport:
             # already had; this one hands the one secret the service is designed
             # never to hold straight to it, and no amount of redaction downstream
             # helps because the disclosure is the request itself.
-            if name in _CREDENTIAL_HEADERS and links.looks_like_a_key(value):
+            shape = _CREDENTIAL_SHAPES.get(name)
+            if shape is not None and not shape.fullmatch(value):
+                expected = (
+                    "an API key is sikkerfil_sk_ and then 43 characters of base64url"
+                    if name == KEY_HEADER
+                    else "a write token is wt_ and then 43 characters, exactly as "
+                    "the service returned it as writeToken when the share was created"
+                )
                 raise ConfigurationError(
-                    f"the value given for {name} is a decryption key, not a "
-                    "credential. A key opens a file and is never sent to the "
-                    "service — it belongs after '#k=' in a link. A write token is "
-                    "what revoking and auditing need; an API key is what sending "
-                    "needs. The value is not repeated here."
+                    f"the value given for {name} is not shaped like a credential: "
+                    f"{expected}. A DECRYPTION KEY is what this most often is by "
+                    "mistake, and it must never be sent to the service — it opens "
+                    "the file, and belongs only after '#k=' in a link. A write token "
+                    "is what revoking and auditing need; an API key is what sending "
+                    "needs. The value is not repeated here, and nothing was sent."
                 )
             if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
                 raise ConfigurationError(

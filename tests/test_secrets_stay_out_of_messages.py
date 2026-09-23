@@ -428,14 +428,31 @@ def test_a_credential_with_a_newline_in_it_never_reaches_http_client() -> None:
 
     client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9")
     for bad in (f"wt_{SECRET}\r\nX: y", f"wt_{SECRET}\n", f"wt_{SECRET}\x7f", f"wt_{SECRET}\x00"):
-        with pytest.raises(ConfigurationError, match="cannot be sent"):
+        # REFUSED BY THE SHAPE NOW, not by the control character — a write token is
+        # wt_ and exactly 43 characters, and a wrapped one is longer than that. Which
+        # guard catches it is not the property under test: that it never reaches
+        # http.client, and that none of it comes back in the message, is.
+        with pytest.raises(ConfigurationError, match="not shaped like a credential"):
             client.revoke("ABCD1234", write_token=bad)
-        # And nothing of it comes back, through the message or the chain.
         try:
             client.revoke("ABCD1234", write_token=bad)
         except ConfigurationError as exc:
             assert not _leaks(str(exc)), str(exc)
             assert exc.__context__ is None
+
+    # AND THE CONTROL-CHARACTER CHECK IS STILL LOAD-BEARING, on the header a caller
+    # can put anything into: content-type on the upload PUT. The credential headers
+    # are now shape-checked first, so testing only those would have left this guard
+    # covered by nothing while still looking covered.
+    # Straight at put_bytes, because send() has to create the share first and there
+    # is nothing listening on port 9 — the refusal under test happens before any
+    # socket, and going through send() would prove only that the port is closed.
+    from sikkerfil.transport import Transport
+
+    upload = Transport("http://127.0.0.1:9", retries=0)
+    for bad_type in ("text/plain\r\nX: y", "text/plain\n", "text/plain\x00", "tekst/plæin"):
+        with pytest.raises(ConfigurationError, match="cannot be sent"):
+            upload.put_bytes("http://127.0.0.1:9/upload", b"x", content_type=bad_type)
 
 
 def test_saving_under_a_key_shaped_name_is_refused_before_it_touches_the_disk() -> None:
@@ -646,18 +663,31 @@ def test_a_decryption_key_is_never_sent_as_a_credential(
     client = Sikkerfil(
         api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9"
     )
-    with pytest.raises(ConfigurationError, match="decryption key"):
+    # THE KEY IS THE WHOLE KEY HERE, not a near miss, and it used to be undecidable:
+    # a write token was 43 characters of base64url and so is a key, so no test of the
+    # value could separate them. The service mints wt_ in front of a token now
+    # (sikkerfil#62), which is what makes this refusal possible at all.
+    with pytest.raises(ConfigurationError, match=r"(?i)decryption key"):
         client.revoke("ABCD1234", write_token=SECRET)
     assert not any(_leaks(value) for value in sent.values()), sent
 
-    with pytest.raises(ConfigurationError, match="decryption key"):
+    with pytest.raises(ConfigurationError, match=r"(?i)decryption key"):
         Sikkerfil(api_key=SECRET, retries=0, base_url="http://127.0.0.1:9").shares()
     assert not any(_leaks(value) for value in sent.values()), sent
+
+    # A NEAR MISS IS STILL A DISCLOSURE. A key one character short decodes to 31
+    # bytes — it is not "a key" to anything that decodes it, and it carries 252 of
+    # the key's 256 bits to the service with sixteen completions left to try.
+    for near in (SECRET[:-1], SECRET + "=", SECRET[:21] + "\n" + SECRET[21:], SECRET.upper()):
+        sent.clear()
+        with pytest.raises(ConfigurationError):
+            client.revoke("ABCD1234", write_token=near)
+        assert not sent, sent
 
     # A real token still goes, or the guard has broken the feature it protects.
     sent.clear()
     with contextlib.suppress(Exception):
-        client.revoke("ABCD1234", write_token="wt_" + "y" * 20)
+        client.revoke("ABCD1234", write_token="wt_" + "y" * 43)
     assert any(value.startswith("wt_") for value in sent.values()), sent
 
 
@@ -689,6 +719,44 @@ def test_an_ordinary_long_hostname_is_still_usable(host: str) -> None:
     assert origin_of(f"https://{host}/s/ABCD1234") == expected
     assert parse_link(f"https://{host}/s/ABCD1234").origin == expected
     assert build_link(f"https://{host}", "ABCD1234", SECRET).startswith(expected + "/")
+
+
+def test_a_key_split_across_labels_or_path_components_is_still_a_key() -> None:
+    """NO SINGLE PIECE IS LONG ENOUGH TO LOOK WRONG, and the whole is still a key.
+
+    ``<key[:21]>.<key[21:]>`` is two labels of twenty-one and twenty-two characters,
+    each under the 32-character threshold a path component gets and each perfectly
+    ordinary to look at — and DNS hands the resolver all forty-three of them. The
+    same trick works down a path, where ``/a/<half>/<half>`` reads as two harmless
+    directories.
+
+    So every CONTIGUOUS RUN of components is joined and tested for being exactly a
+    key, which is a test a fixed-size secret allows and a heuristic would not: joining
+    the labels of ``my-company-files.example.com`` gives twenty-six base64url
+    characters, and exactness is what keeps that ordinary name working.
+
+    THIS TEST IS HERE BECAUSE DELETING THAT LOOP BROKE NOTHING. The behaviour was
+    checked by hand in a shell, and I recorded it as verified — a fix nothing holds
+    on to is a fix that leaves with the next refactor.
+    """
+    from sikkerfil.links import origin_of, path_carries_key_material, redacted_path
+
+    for cut in (21, 12, 30):
+        halves = (SECRET[:cut], SECRET[cut:])
+        assert origin_of(f"https://{halves[0]}.{halves[1]}/x") == "", cut
+        assert path_carries_key_material(f"/a/{halves[0]}/{halves[1]}"), cut
+        redacted = redacted_path(f"/a/{halves[0]}/{halves[1]}")
+        assert not _leaks(redacted), redacted
+        # Three pieces, and the join has to span all three.
+        thirds = f"/{SECRET[:14]}/{SECRET[14:28]}/{SECRET[28:]}"
+        assert path_carries_key_material(thirds)
+        assert not _leaks(redacted_path(thirds))
+
+    # And the ordinary name the exactness protects is untouched.
+    assert origin_of("https://my-company-files.example.com/x") == (
+        "https://my-company-files.example.com"
+    )
+    assert not path_carries_key_material("/home/me/Documents/kvartalsrapport-2026-q3.pdf")
 
 
 def test_a_key_hidden_in_a_host_by_percent_encoding_or_a_scheme_is_refused() -> None:

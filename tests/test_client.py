@@ -26,10 +26,15 @@ from sikkerfil.transport import API_PREFIX, DIGEST_HEADER, sha256_hex
 
 PLAINTEXT = b"Kvartalsrapport Q3\nOmsetning: 4 200 000 NOK\n"
 
+#: A KEY OF THE SHAPE THE SERVICE MINTS — sikkerfil_sk_ and 43 characters of
+#: base64url, as app/src/key-format.ts spells it. Transport refuses anything else on
+#: the credential header, so "k" used to be enough here only because nothing checked.
+API_KEY = "sikkerfil_sk_" + "a" * 43
+
 
 @pytest.fixture
 def client(stub) -> Sikkerfil:
-    return Sikkerfil(api_key="sikkerfil_sk_" + "a" * 43, base_url=stub.base_url, retries=0)
+    return Sikkerfil(api_key=API_KEY, base_url=stub.base_url, retries=0)
 
 
 # --- The round trip ----------------------------------------------------------
@@ -175,14 +180,14 @@ def test_the_origin_is_sent_only_for_a_real_market(stub) -> None:
     ``bad_origin`` — so the market check is not cosmetic, it is what keeps a
     custom base URL usable at all.
     """
-    client = Sikkerfil(api_key="k", base_url=stub.base_url, retries=0)
+    client = Sikkerfil(api_key=API_KEY, base_url=stub.base_url, retries=0)
     client.send(PLAINTEXT)
     created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert "origin" not in created
 
     from sikkerfil.client import Sikkerfil as Real
 
-    real = Real(api_key="k", market="dk")
+    real = Real(api_key=API_KEY, market="dk")
     assert real.base_url == "https://sikkerfil.dk"
 
 
@@ -299,10 +304,10 @@ def test_inspect_reports_metadata_without_downloading(client: Sikkerfil, stub) -
 
 
 def test_a_client_is_configured_from_the_environment(monkeypatch, stub) -> None:
-    monkeypatch.setenv("SIKKERFIL_API_KEY", "sikkerfil_sk_from_env")
+    monkeypatch.setenv("SIKKERFIL_API_KEY", API_KEY)
     monkeypatch.setenv("SIKKERFIL_BASE_URL", stub.base_url)
     client = Sikkerfil()
-    assert client.api_key == "sikkerfil_sk_from_env"
+    assert client.api_key == API_KEY
     assert client.base_url == stub.base_url
 
 
@@ -310,7 +315,7 @@ def test_market_and_base_url_together_is_refused() -> None:
     # They contradict each other and silently preferring one is how somebody
     # ships to the wrong market.
     with pytest.raises(ConfigurationError, match="not both"):
-        Sikkerfil(api_key="k", market="se", base_url="https://example.test")
+        Sikkerfil(api_key=API_KEY, market="se", base_url="https://example.test")
 
 
 def test_the_key_opens_the_file_however_it_is_spelled(client: Sikkerfil, stub) -> None:
@@ -423,3 +428,66 @@ def test_an_ordinary_missing_file_is_still_named_in_full(
     with pytest.raises(ConfigurationError) as caught:
         client.send(path)
     assert path in str(caught.value), str(caught.value)
+
+
+def test_the_shares_own_key_passed_as_its_write_token_is_refused(client: Sikkerfil) -> None:
+    """The column mix-up, caught where both values are in hand.
+
+    ``wt_`` in front of a real token means transport can refuse a key on a credential
+    header by shape alone — but only because the service was changed to mint it
+    (sikkerfil#62). This guard does not depend on that: SentShare carries the key and
+    the token, so the two can be compared rather than recognised, and the message can
+    say which of them was handed over.
+
+    Every spelling of the key, because one key has three and a caller holds whichever
+    they were given: bytes are not the mistake anyone makes here, but a padded or
+    line-wrapped paste out of a config file is.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    for spelling in (sent.key, sent.key + "=", sent.key[:21] + "\n" + sent.key[21:]):
+        # THE PHRASE IS THE POINT, and the first version of this test did not have
+        # it: transport's own refusal also contains "DECRYPTION KEY", so matching on
+        # that alone passed with this guard deleted. "this share's" is only sayable
+        # where the share's key is in hand — which is the thing under test.
+        with pytest.raises(ConfigurationError, match=r"this share's DECRYPTION KEY") as caught:
+            client.revoke(sent, write_token=spelling)
+        # And the message does not repeat the thing it is refusing.
+        assert sent.key not in str(caught.value)
+        assert sent.key[:12] not in str(caught.value)
+
+    # The share is still revocable with the token it was actually issued.
+    client.revoke(sent)
+
+
+@pytest.mark.parametrize("slot", ["name", "content_type", "password"])
+def test_a_key_in_a_send_parameter_never_reaches_the_body(
+    slot: str, client: Sikkerfil, stub
+) -> None:
+    """THE BODY IS THE WIRE TOO.
+
+    ``name``, ``content_type`` and ``password`` go to the service as they were given,
+    in the JSON that creates the share. The credential headers were guarded and these
+    were not, so ``send(data, name=<the key>)`` posted the decryption key beside the
+    size and the expiry — to the one party the whole design exists to keep it from.
+
+    With an affix, because that is where "only a value that IS a key" broke: a key
+    with ``user:`` in front of it or ``-old`` after it is not a key to a strict
+    comparison, and carries all 256 bits regardless.
+    """
+    key = crypto.new_key()
+    text = crypto.b64url_encode(key)
+    before = len(stub.requests)
+    for spelling in (text, f"user:{text}", f"{text}-old", text + "=="):
+        with pytest.raises(ConfigurationError) as caught:
+            client.send(PLAINTEXT, **{slot: spelling})
+        assert text not in str(caught.value)
+        assert "decryption key" in str(caught.value)
+    assert len(stub.requests) == before, "the share was created before the refusal"
+
+    # And an ordinary value of each still goes through.
+    ordinary = {
+        "name": "kvartalsrapport-2026-q3",
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "password": "hemmelig-passord",
+    }[slot]
+    client.send(PLAINTEXT, **{slot: ordinary})

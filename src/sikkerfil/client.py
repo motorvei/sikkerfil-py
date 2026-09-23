@@ -34,6 +34,7 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import IO, Any, Union
+from urllib.parse import urlsplit
 
 from . import crypto, links
 from .errors import (
@@ -111,7 +112,7 @@ class Sikkerfil:
         # behind a reverse proxy may legitimately pass https://host/sikkerfil. So it is
         # asked whether this is a usable http(s) origin carrying no key material, and
         # the caller's own string is what gets used.
-        if not origin_of(resolved):
+        if not _usable_base_url(resolved):
             raise ConfigurationError(
                 "base_url must be an http(s) address — a market's front door, or your "
                 "own host. It is not repeated here, in case it carries a key: a "
@@ -163,6 +164,7 @@ class Sikkerfil:
         # who forgot their key encrypts four gigabytes and is then told the
         # request was never going to be made.
         key_headers = self._key_headers()
+        _nothing_here_is_a_key(name=name, content_type=content_type, password=password)
 
         plaintext, derived_name = _read_source(source)
         if filename is None:
@@ -443,6 +445,31 @@ def inspect(
     return _client_for(link, timeout, market).inspect(link)
 
 
+def _usable_base_url(candidate: str) -> bool:
+    """Whether every part of ``candidate`` is safe to put in front of a request.
+
+    ORIGIN_OF ANSWERS FOR THE SCHEME AND HOST, and the first version of this stopped
+    there — then kept the caller's whole string, so ``https://host.example/<a key>``
+    was accepted and the key went into every request PATH. I had even written that the
+    gap between "what was validated" and "what is used" was worth watching, and then
+    shipped it anyway.
+
+    So: the origin has to be usable, a path may survive (somebody behind a reverse
+    proxy passes https://host/sikkerfil) but only if it carries no key material, and a
+    query, fragment or userinfo is refused outright — none of them belongs in a base
+    URL, and each is another place for a secret to ride along.
+    """
+    if not origin_of(candidate):
+        return False
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return False
+    if parts.query or parts.fragment or "@" in parts.netloc:
+        return False
+    return not links.path_carries_key_material(parts.path)
+
+
 def _client_for(link: str, timeout: float, market: str | None = None) -> Sikkerfil:
     """Build a client for whichever market the link points at.
 
@@ -496,6 +523,61 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
     raise ConfigurationError(f"cannot send a {type(source).__name__}; pass a path, bytes or a file")
 
 
+def _nothing_here_is_a_key(
+    *, name: str | None, content_type: str | None, password: str | None
+) -> None:
+    """The three send() parameters that reach the service AS THEY WERE GIVEN.
+
+    A DISCLOSURE IN A BODY IS A DISCLOSURE. The credential headers were guarded and
+    these were not, so ``send(data, name=<the key>)`` serialised the decryption key
+    into the JSON that creates the share — beside the size and the expiry, on its way
+    to the one party the design exists to keep it from. ``content_type`` and
+    ``password`` do the same. Found by handing a key to every string parameter in the
+    library and then looking at the request BODY, which the sweep had never read.
+
+    ``filename`` is deliberately not in this list: it is sealed under the file's own
+    key before it goes anywhere, so a key pasted there is encrypted, not sent.
+
+    THREE PARAMETERS, TWO THRESHOLDS, for a reason:
+
+    * ``name`` becomes a path component of a public link (``sikkerfil.no/<name>``), so
+      it gets the PATH threshold — the one that leaves ``kvartalsrapport-2026-q3``
+      alone. Refusing a name costs the caller the name they wanted; a 32-character
+      base64url run is not a name anybody wanted.
+    * ``content_type`` is ``type/subtype``, and the path predicate splits on the slash
+      exactly as that needs. A 32-character run inside a MIME type is not a MIME type.
+    * ``password`` gets the same threshold, AFTER EXACTNESS WAS TRIED AND WAS WRONG.
+      "Only a value that is a key to the character" reads as careful and let
+      ``user:<key>`` and ``<key>-old`` through — each carrying all 256 bits to the
+      service, which is the whole disclosure with a decoration on the front. The
+      sweep found both within a minute of being pointed at request bodies. A run
+      threshold costs a caller whose password is 32 unbroken base64url characters,
+      and that is the right side to err on.
+    """
+    if name and links.path_carries_key_material(name):
+        raise ConfigurationError(
+            "the share name given carries what looks like a decryption key. A name "
+            "goes to the service in the clear and becomes part of a public link, so "
+            "a key in it is published as well as disclosed. The key belongs after "
+            "'#k=' in the link the send returns. The value is not repeated here."
+        )
+    if content_type and links.path_carries_key_material(content_type):
+        raise ConfigurationError(
+            "the content type given carries what looks like a decryption key. It is "
+            "sent to the service as a hint for the recipient, which is the one place "
+            "a key must never go. The value is not repeated here."
+        )
+    if password and links.path_carries_key_material(password):
+        raise ConfigurationError(
+            "the password given carries what looks like a decryption key. A password "
+            "is sent to the service, which hashes it — so a key used as one is handed "
+            "to the service in the same breath as the file it opens. The key belongs "
+            "after '#k=' in the link. A password of your own is fine; what is refused "
+            "is 32 or more characters of base64url in a row, which no password anybody "
+            "chose looks like. The value is not repeated here."
+        )
+
+
 def _guess_type(filename: str | None) -> str:
     if not filename:
         return "application/octet-stream"
@@ -504,6 +586,20 @@ def _guess_type(filename: str | None) -> str:
 
 def _identify(share: str | SentShare, write_token: str | None) -> tuple[str, str]:
     if isinstance(share, SentShare):
+        # THE ONE PLACE A KEY PASSED AS A TOKEN CAN BE CAUGHT. Both values are 43
+        # characters of base64url — the service mints a write token as 32 random
+        # bytes in base64url, which is a decryption key's spelling exactly — so
+        # transport's shape check cannot tell them apart, and says so. Here the
+        # share's own key is in hand, so the column mix-up that motivated the check
+        # (revoke(sent, write_token=sent.key)) is decidable rather than guessed at.
+        if write_token and _same_key(write_token, share.key):
+            raise ConfigurationError(
+                "the write token given is this share's DECRYPTION KEY. The key opens "
+                "the file and is never sent to the service — it belongs after '#k=' "
+                "in the link. The write token is SentShare.write_token, which is a "
+                "different 43 characters. Neither value is repeated here, and "
+                "nothing was sent."
+            )
         return share.id, write_token or share.write_token
     if not write_token:
         raise ConfigurationError(
@@ -519,6 +615,18 @@ def _identify(share: str | SentShare, write_token: str | None) -> tuple[str, str
         # different file was the whole reason it was missed.
         raise ConfigurationError(f"{describe(share)}. A share id is {SHARE_ID.pattern}")
     return share, write_token
+
+
+def _same_key(candidate: str, key: str) -> bool:
+    """Whether these two spellings are the same key.
+
+    Through key_text so that padding, a newline or a line wrap do not make one key
+    read as two — the comparison links.looks_like_a_key was written for.
+    """
+    try:
+        return crypto.key_text(candidate) == crypto.key_text(key)
+    except ConfigurationError:
+        return False
 
 
 def _download_refusal(exc: ApiError, share: Share, password_given: bool) -> ApiError:

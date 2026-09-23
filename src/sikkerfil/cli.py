@@ -34,6 +34,27 @@ _DURATION = re.compile(r"^(\d+)\s*([smhdw]?)$", re.IGNORECASE)
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "": 1}
 
 
+def count(text: str) -> int:
+    """A positive integer, refused WITHOUT echoing what was given.
+
+    argparse's own ``type=int`` formats a failure as "invalid int value: '<the value>'"
+    and writes it to stderr itself — so ``--max-downloads <a key>`` printed the key
+    before any of our code ran. Same mechanism as ``choices=``, which was removed from
+    ``--market`` for the same reason, and which I fixed there without looking for
+    other argparse-owned conversions.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f"{quoted(text)} is not a whole number. It is not repeated here if it "
+            "might be a key: a decryption key is not a count."
+        )
+    return value
+
+
 def duration(text: str) -> int:
     """``90``, ``30m``, ``24h``, ``7d`` — seconds either way."""
     match = _DURATION.match(text.strip())
@@ -69,7 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     send.add_argument("file", help="the file to send, or - for stdin")
     send.add_argument("--name-as", metavar="NAME", help="seal this filename instead")
     send.add_argument("--expires", type=duration, metavar="DURATION", help="e.g. 24h, 7d")
-    send.add_argument("--max-downloads", type=int, metavar="N")
+    send.add_argument("--max-downloads", type=count, metavar="N")
     send.add_argument("--password", metavar="SECRET", help="an extra secret the recipient needs")
     send.add_argument("--link-name", metavar="NAME", help="claim sikkerfil.no/NAME")
     send.add_argument("--json", action="store_true", help="print the full result as JSON")

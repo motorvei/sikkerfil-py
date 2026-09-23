@@ -16,6 +16,8 @@ refuse it at the edge. No functional test in this repository can close that gap.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import threading
 from collections.abc import Iterator
@@ -55,6 +57,22 @@ class Scripted:
     status: int
     body: bytes
     headers: dict[str, str] = field(default_factory=dict)
+
+
+def _write_token(share_id: str) -> str:
+    """The shape the SERVICE mints — ``newWriteToken()`` in app/src/ids.ts.
+
+    THIS LINE WAS THE BUG. It used to be ``f"wt-{share_id}"``, and the library grew a
+    check that a credential header starts with ``sikkerfil_sk_`` or ``wt_``. Every
+    test here passed. Every real caller would have had revoke() and audit() raise on
+    the first call, because the service minted 43 characters of base64url and no
+    prefix at all. A double that invents its own shapes tests the double, and this
+    one agreed with the documentation instead of with the code.
+
+    Derived from the id rather than random so a recorded request stays reproducible.
+    """
+    random_part = base64.urlsafe_b64encode(hashlib.sha256(share_id.encode()).digest())
+    return "wt_" + random_part.decode().rstrip("=")
 
 
 class StubService:
@@ -194,7 +212,7 @@ class StubService:
         share = {
             "id": share_id,
             "state": "pending",
-            "writeToken": f"wt-{share_id}",
+            "writeToken": _write_token(share_id),
             "sizeBytes": body["sizeBytes"],
             "contentType": body.get("contentType", "application/octet-stream"),
             "encryptedName": body.get("encryptedName"),

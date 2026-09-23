@@ -86,8 +86,17 @@ RUN = links.KEY_RUN
 
 #: Plausible values for the parameters that gate a call, so filling them reaches the
 #: code under test instead of stopping at the door.
-_PLAUSIBLE = {
-    "write_token": "wt_" + "y" * 20,
+_PLAUSIBLE: dict[str, Any] = {
+    # BYTES, AND NOT A FILENAME, so send() gets past _read_source and assembles a
+    # request. With "ABCD1234" here it stopped at a missing file, and send() — which
+    # puts three caller-supplied values in the body that creates the share — was
+    # swept only as far as its front door. name, content_type and password each sent
+    # the key to the service, and this dict is why nothing said so.
+    "source": b"payload",
+    # THE SHAPE THE SERVICE MINTS: wt_ and 43 characters. A shorter stand-in is
+    # refused on the credential header, which stops revoke() and audit() at the
+    # header instead of letting the sweep reach what they do with the value.
+    "write_token": "wt_" + "y" * 43,
     "password": "hemmelig",
     "market": "no",
     "api_key": "sikkerfil_sk_" + "x" * 43,
@@ -131,7 +140,17 @@ def _leaks_in(text: str, key: str) -> bool:
     folds back to one in a single call. A hunt that reads only the literal spelling
     cannot see the disclosure it is looking for.
     """
-    haystacks = (text.lower(), unicodedata.normalize("NFKC", text).lower())
+    # WHITESPACE OUT OF THE HAYSTACK TOO. The library strips it before decoding, so an
+    # entry point that echoes the spaced or wrapped spelling verbatim has disclosed a
+    # key the library would accept — and searching only contiguous substrings could not
+    # see it. My own predicate had the exact hole I had just fixed in links.py.
+    folded = unicodedata.normalize("NFKC", text)
+    haystacks = (
+        text.lower(),
+        folded.lower(),
+        "".join(text.split()).lower(),
+        "".join(folded.split()).lower(),
+    )
     return any(
         key[i : i + RUN].lower() in haystack
         for haystack in haystacks
@@ -214,7 +233,7 @@ def _callables() -> list[tuple[str, Any]]:
             models.SentShare(
                 id="ABCD1234",
                 url="http://127.0.0.1:9/s/ABCD1234#k=" + BASE,
-                write_token="wt_x",
+                write_token="wt_" + "y" * 43,
                 key=BASE,
                 expires_at=0,
                 size_bytes=1,
@@ -355,8 +374,19 @@ def _sealed_off(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> list
     attempted: list[str] = []
 
     def refuse(request: Any, *args: Any, **kwargs: Any) -> Any:
-        url = getattr(request, "full_url", str(request))
-        attempted.append(url)
+        # THE BODY AND THE HEADERS TOO, not just the URL. Recording only full_url
+        # meant a call that put the key in a JSON body counted as a safely-attempted
+        # request: send(content_type=<key>) and send(name=<key>) serialise straight
+        # into post_json, and the URLError that came back carried no key, so the case
+        # PASSED. A server-bound disclosure was satisfying the sweep.
+        attempted.append(getattr(request, "full_url", str(request)))
+        body = getattr(request, "data", None)
+        if body:
+            if isinstance(body, bytes):
+                attempted.append(body.decode("utf-8", "replace"))
+            else:
+                attempted.append(str(body))
+        attempted.extend(f"{n}: {v}" for n, v in getattr(request, "header_items", list)())
         raise urllib.error.URLError("the sweep does not use the network")
 
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
@@ -449,9 +479,10 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
         ["receive", handed],
         ["inspect", handed],
         ["send", handed],
-        ["revoke", handed, "--write-token", "wt_x"],
-        ["audit", handed, "--write-token", "wt_x"],
+        ["revoke", handed, "--write-token", "wt_" + "y" * 43],
+        ["audit", handed, "--write-token", "wt_" + "y" * 43],
         ["send", "rapport.pdf", "--expires", handed],
+        ["send", "rapport.pdf", "--max-downloads", handed],
     ):
         out, err = io.StringIO(), io.StringIO()
         calls += 1
@@ -492,7 +523,17 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
 
     # Said out loud, because "it did not leak" is worth nothing if the call never
     # ran the code under test and merely failed to resolve a hostname.
-    outside = [u for u in _sealed_off if "127.0.0.1:9" not in u]
+    outside = [
+        u for u in _sealed_off if u.startswith(("http://", "https://")) and "127.0.0.1:9" not in u
+    ]
     assert not outside, "the sweep tried to leave the machine:\n  " + "\n  ".join(
         sorted(set(outside))
+    )
+
+    # AND NOTHING SERVER-BOUND CARRIED THE KEY. The URL, the headers and the body are
+    # all recorded, because a disclosure to the service is not softened by the request
+    # having failed — the bytes were assembled and handed over.
+    bound = [u for u in _sealed_off if _leaks_in(u, key)]
+    assert not bound, "these were about to send the key to a server:\n  " + "\n  ".join(
+        sorted(set(bound))[:6]
     )

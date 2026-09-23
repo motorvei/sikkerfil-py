@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -292,7 +293,7 @@ def origin_of(link: str) -> str:
         return ""
 
     decoded = unquote(host)
-    if any(_run_in(label, _PATH_CHARACTERS) for label in decoded.replace(":", ".").split(".")):
+    if structured_carries_key(decoded.replace(":", ".").split(".")):
         return ""
 
     authority = f"[{host}]" if ":" in host else host
@@ -315,6 +316,34 @@ def redacted(link: str) -> str:
     return f"{origin}/<unrecognised>" if origin else "<unrecognised>"
 
 
+def structured_carries_key(parts: Sequence[str]) -> bool:
+    """Whether a value split into ``parts`` carries a key — as a part, or across them.
+
+    THE SEPARATOR WAS THE BYPASS, three times in one review. Checking components
+    independently is what lets ordinary hostnames and paths print, and it is also
+    what let a key be smuggled through in pieces:
+
+        "a"*21 + "." + "a"*21 + "g"      a host whose labels are both under the bar
+        key[:21] + "/" + key[21:]        a path whose components are both under it
+
+    Each piece is short enough to look innocent; the browser or the resolver puts
+    them back together. So the per-part threshold stays, for the ordinary case, and
+    every CONTIGUOUS RUN of parts is also joined and tested for being exactly a key.
+
+    Exactly a key, not a run: joining ``my-company-files.example.com`` gives
+    twenty-six base64url characters, which a run test would refuse and which is not
+    a key. Exactness is available here because a key is a fixed size, and a fixed
+    size is the one thing a heuristic never needs to guess at.
+    """
+    if any(_run_in(part, _PATH_CHARACTERS) for part in parts):
+        return True
+    for start in range(len(parts)):
+        for end in range(start + 2, len(parts) + 1):
+            if looks_like_a_key("".join(parts[start:end])):
+                return True
+    return False
+
+
 def path_carries_key_material(path: str) -> bool:
     """Whether any COMPONENT of ``path`` could carry key material.
 
@@ -324,7 +353,7 @@ def path_carries_key_material(path: str) -> bool:
     used the value threshold here anyway, which cost this suite's own tmp_path a
     second time.
     """
-    return any(_run_in(part, _PATH_CHARACTERS) for part in path.split("/"))
+    return structured_carries_key(path.split("/"))
 
 
 def redacted_path(path: str) -> str:
@@ -343,10 +372,35 @@ def redacted_path(path: str) -> str:
     names a directory. The two numbers answer genuinely different questions: for a
     value, refusing costs nothing; for a path, refusing costs the name.
     """
+    parts = path.split("/")
+    suspect = _parts_carrying_key(parts)
+    if not suspect:
+        return path
     return "/".join(
-        f"<{len(part)} characters, not repeated>" if _run_in(part, _PATH_CHARACTERS) else part
-        for part in path.split("/")
+        f"<{len(part)} characters, not repeated>" if index in suspect else part
+        for index, part in enumerate(parts)
     )
+
+
+def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
+    """Which components could carry key material — alone, or joined to a neighbour.
+
+    A KEY SPLIT ACROSS COMPONENTS is carried by none of them on its own:
+    ``key[:21] + "/" + key[21:]`` has two parts, both under the threshold, and the
+    message printed every character. So each contiguous run of components is joined
+    and tested for being exactly a key, and every component in a run that matches is
+    marked.
+
+    ONLY THE PARTICIPANTS, though. Redacting the whole path throws away the half that
+    identifies the mistake — "/home/me/<a key>" should name the directory and withhold
+    the name. My first version hid "home" and "me" too, which is safe and useless.
+    """
+    suspect = {index for index, part in enumerate(parts) if _run_in(part, _PATH_CHARACTERS)}
+    for start in range(len(parts)):
+        for end in range(start + 2, len(parts) + 1):
+            if looks_like_a_key("".join(parts[start:end])):
+                suspect.update(range(start, end))
+    return suspect
 
 
 def describe(value: str) -> str:
