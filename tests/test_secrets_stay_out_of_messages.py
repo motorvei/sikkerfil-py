@@ -795,9 +795,36 @@ def test_a_key_as_base_url_is_refused_at_construction() -> None:
             Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=bad, retries=0)
         assert not _leaks(str(caught.value)), str(caught.value)
 
+    # EVERY PART OF THE STRING THAT IS KEPT, not just the part origin_of reads. The
+    # verdict comes from origin_of and the caller's own string is what gets used — so
+    # the components origin_of drops were validated by nothing, and a key in the path
+    # went into every request. Query, fragment and userinfo are refused outright:
+    # none of them belongs in a base URL, and each is another place to hide a secret.
+    #
+    # THIS WAS HELD BY NO TEST until it was written down here. I checked it in a shell,
+    # saw the right answers and recorded it as verified; deleting the checks broke
+    # nothing at all.
+    for retained in (
+        f"https://host.example/{SECRET}",
+        f"https://host.example/a/{SECRET[:21]}/{SECRET[21:]}",
+        f"https://host.example/?k={SECRET}",
+        f"https://host.example/#k={SECRET}",
+        f"https://user:{SECRET}@host.example",
+    ):
+        with pytest.raises(ConfigurationError) as caught:
+            Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=retained, retries=0)
+        assert not _leaks(str(caught.value)), str(caught.value)
+
     # And a reverse-proxy path prefix still works, since origin_of's answer is used
-    # as a verdict and not as the value.
+    # as a verdict and not as the value. An IPv6 literal too, which a previous version
+    # of this area broke.
     client = Sikkerfil(
         api_key="sikkerfil_sk_" + "x" * 43, base_url="https://host.example/sikkerfil", retries=0
     )
     assert client.base_url == "https://host.example/sikkerfil"
+    assert (
+        Sikkerfil(
+            api_key="sikkerfil_sk_" + "x" * 43, base_url="http://[::1]:5000", retries=0
+        ).base_url
+        == "http://[::1]:5000"
+    )
