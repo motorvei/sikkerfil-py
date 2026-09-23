@@ -21,6 +21,7 @@ import ast
 import base64
 import binascii
 import re
+import string
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -390,6 +391,9 @@ def renders_key_bytes(value: str) -> bool:
     if len(spelled) == KEY_TEXT_LENGTH and looks_like_a_key(spelled):
         return True
 
+    if _is_base64_under_some_altchars(compact):
+        return True
+
     if _is_hex_of_a_key(compact):
         return True
 
@@ -453,6 +457,39 @@ def renders_key_bytes(value: str) -> bool:
     return False
 
 
+def _is_base64_under_some_altchars(compact: str) -> bool:
+    """Base64 of 32 bytes in an alphabet the CALLER chose the last two letters of.
+
+    ``b64encode`` takes an ``altchars`` argument, and ``b64decode`` takes it back, so
+    ``b64encode(raw_key, altchars=b"~!")`` is a rendering anybody holding those two
+    characters can reverse — and the two alphabets this module knew about, standard
+    and url-safe, are simply the two that have names. The argument is two arbitrary
+    bytes; there are thousands of alphabets, and enumerating them was never going to
+    work.
+
+    So the question is asked about the SHAPE instead: 43 characters, of which at most
+    two are not letters or digits. Those two are the altchars, whatever they are, and
+    the other sixty-two characters of the alphabet are fixed by the standard.
+
+    THIS IS A DEGENERATE TEST AND IT LIVES WHERE THEY LIVE — in ``renders_key_bytes``,
+    which is only ever asked about a WHOLE value a caller handed over, never about a
+    join, a window or a subsequence. It is strictly wider than the base64url test
+    beside it, and that width is the same width: a 43-character password with one or
+    two kinds of punctuation in it is refused, by name, with a message saying what to
+    change. What it must never do is reach the path scan, where "one component of a
+    domain" would start meeting it by accident.
+    """
+    spelled = compact.rstrip("=")
+    if len(spelled) != KEY_TEXT_LENGTH:
+        return False
+    strange = {character for character in spelled if character not in _BASE64_CORE}
+    if len(strange) > 2:
+        return False
+    # altchars is two BYTES. A character that does not fit in one is not one of them,
+    # and "=" is padding rather than an alphabet letter.
+    return all(character.isascii() and character != "=" for character in strange)
+
+
 def _is_hex_of_a_key(compact: str) -> bool:
     """Whether ``compact`` is 32 bytes in hex, with or without a separator.
 
@@ -473,19 +510,37 @@ def _is_hex_of_a_key(compact: str) -> bool:
             break
         if len(candidate) != KEY_BYTES * 2 + groups - 1:
             continue
-        separators: set[str] = set()
-        digits: list[str] = []
-        at = 0
-        for group in range(groups):
-            size = 2 * min(per_group, KEY_BYTES - group * per_group)
-            digits.append(candidate[at : at + size])
-            at += size
-            if group < groups - 1:
-                separators.add(candidate[at])
-                at += 1
-        if len(separators) == 1 and all(_is_hex(piece) for piece in digits):
+        whole = [per_group] * (KEY_BYTES // per_group)
+        remainder = KEY_BYTES % per_group
+        # THE SHORT GROUP IS FIRST OR LAST DEPENDING ON THE SIGN, and the version
+        # before this one knew only about last. bytes_per_sep counts from the left
+        # when it is NEGATIVE and from the right when it is positive — and positive
+        # is what a reader types — so bytes(range(32)).hex(".", 3) is "0001." and
+        # then ten groups of six, and every test I wrote for the separator walked
+        # past it while the one with the minus sign passed. When the size divides 32
+        # there is no short group and the two layouts are the same list.
+        layouts = [[*whole, remainder], [remainder, *whole]] if remainder else [whole]
+        if any(_hex_groups_agree(candidate, sizes) for sizes in layouts):
             return True
     return False
+
+
+def _hex_groups_agree(candidate: str, sizes: Sequence[int]) -> bool:
+    """Whether ``candidate`` is groups of that many BYTES of hex, one separator apart.
+
+    The separators have to agree with each other; hex() writes the same character
+    between every group.
+    """
+    separators: set[str] = set()
+    at = 0
+    for index, size in enumerate(sizes):
+        if not _is_hex(candidate[at : at + size * 2]):
+            return False
+        at += size * 2
+        if index < len(sizes) - 1:
+            separators.add(candidate[at])
+            at += 1
+    return len(separators) == 1
 
 
 def _is_base32_of_a_key(compact: str) -> bool:
@@ -780,11 +835,32 @@ def _subsequence_renders_key_strictly(parts: Sequence[str]) -> set[int]:
     "privatesecurefilescompanyinternalexamplecom" is forty-three characters of
     base64url, and it is a domain.
     """
+    # THE JOIN HAS A LENGTH AND SO THE SCAN HAS A CEILING. The version before this
+    # one joined and tested every contiguous run — quadratically many runs, each join
+    # linear — so a path of 1600 components took 25 SECONDS inside send(), which is
+    # not a false positive but is just as much a broken call. A strict rendering of 32
+    # bytes is between 56 and 97 characters long; a run already past 97 cannot become
+    # one by growing, and a run of any other length cannot be one at all. Both facts
+    # are derived from the encoders rather than assumed, and together they turn the
+    # scan into one bounded walk per starting component.
+    #
+    # WHITESPACE IS TAKEN OUT FIRST, because renders_key_bytes_strictly takes it out
+    # too: measuring "my report.txt" as thirteen characters when the test will see
+    # twelve would skip the length that matches.
+    compacted = ["".join(part.split()) for part in parts]
     suspect: set[int] = set()
-    for start in range(len(parts)):
-        for end in range(start + 2, len(parts) + 1):
-            if renders_key_bytes_strictly("".join(parts[start:end])):
-                suspect.update(range(start, end))
+    for start in range(len(compacted)):
+        width = len(compacted[start])
+        if width > _WIDEST_STRICT:
+            continue
+        for end in range(start + 1, len(compacted)):
+            width += len(compacted[end])
+            if width > _WIDEST_STRICT:
+                break
+            if width not in _STRICT_WIDTHS:
+                continue
+            if renders_key_bytes_strictly("".join(compacted[start : end + 1])):
+                suspect.update(range(start, end + 1))
     return suspect
 
 
@@ -1017,6 +1093,19 @@ _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _STRICT_LENGTHS = sorted(
     {56, 64} | {64 + -(-KEY_BYTES // per_group) - 1 for per_group in range(1, KEY_BYTES)}
 )
+
+#: The same lengths, plus the two characters of a "0x" prefix, which _is_hex_of_a_key
+#: strips before it measures anything. Used to skip joins that cannot match at all.
+_STRICT_WIDTHS = frozenset(_STRICT_LENGTHS) | {
+    length + 2 for length in _STRICT_LENGTHS
+}
+
+#: Past this, no join is a strict rendering of a key however much more is added to it.
+_WIDEST_STRICT = max(_STRICT_WIDTHS)
+
+#: The sixty-two letters of base64 that no ``altchars`` argument can move. The other
+#: two — 62 and 63, "+" and "/" by default — are whatever the caller passed.
+_BASE64_CORE = frozenset(string.ascii_letters + string.digits)
 
 #: A component that is nothing but key alphabet — no dot, no space, no extension.
 _EVENLY_CHUNKED = re.compile(r"[A-Za-z0-9_-]+")

@@ -1302,6 +1302,12 @@ def _every_rendering_the_standard_library_makes(raw: bytes) -> dict[str, str]:
         # EVERY SEPARATOR bytes.hex() will take, not the two I thought of.
         **{f"hex({sep!r})": raw.hex(sep) for sep in ".:-_|+ "},
         "hex grouped": raw.hex(" ", 4),
+        # BOTH SIGNS OF bytes_per_sep, at sizes that do NOT divide 32. Negative
+        # counts groups from the left and positive from the right, so the short
+        # group changes ends — and every grouped vector here used to divide 32,
+        # which is exactly where the two layouts agree.
+        **{f"hex(' ', {n})": raw.hex(" ", n) for n in (3, 5, 6, 7, 9, 12, 20, 31)},
+        **{f"hex(' ', -{n})": raw.hex(" ", -n) for n in (3, 5, 6, 7, 9, 12, 20, 31)},
         "hex 0x": "0x" + raw.hex(),
     }
     # z85 exists from 3.13, which this package supports; the interpreter running the
@@ -1576,3 +1582,148 @@ def test_our_own_refusals_do_not_print_a_rendering() -> None:
     # And what a person actually mistypes still prints, or the message is useless.
     for ordinary in ("nope", "NO", "sv", "x", "no/"):
         assert repr(ordinary) == quoted(ordinary), ordinary
+
+
+# --- Round twenty-two: the sign of a separator, the cost of a scan --------------
+
+
+def test_hex_groups_are_counted_from_the_right_too() -> None:
+    """``bytes_per_sep`` IS SIGNED, and the shape parser knew only one of the signs.
+
+    ``bytes.hex(sep, n)`` counts groups from the LEFT when ``n`` is negative and from
+    the RIGHT when it is positive — and positive is what a reader types. So when the
+    group size does not divide 32 the short group is FIRST, and the parser, which
+    built its groups left to right with the remainder at the end, walked straight
+    past ``bytes(range(32)).hex(".", 3)``: "0001." and then ten groups of six.
+
+    Every size from one to thirty-one, both signs, because the sizes that divide 32
+    are exactly the ones where the two layouts agree — and 1, 2, 4, 8 and 16 were the
+    sizes the round before this one tested.
+    """
+    from sikkerfil.links import (
+        opaque_carries_key_material,
+        path_carries_key_material,
+        quoted,
+        renders_key_bytes,
+        renders_key_bytes_strictly,
+    )
+
+    raw = bytes(range(32))
+    for per_group in range(1, 32):
+        for signed in (per_group, -per_group):
+            for separator in ".:-_| abcdef0123":
+                spelling = raw.hex(separator, signed)
+                assert renders_key_bytes(spelling), f"{signed} {separator!r}"
+                assert renders_key_bytes_strictly(spelling), f"{signed} {separator!r}"
+                assert opaque_carries_key_material(spelling), f"{signed} {separator!r}"
+                assert "not repeated" in quoted(spelling), f"{signed} {separator!r}"
+            assert path_carries_key_material(raw.hex("/", signed)), signed
+
+    # And the shape is a shape: a group short by one character is not 32 bytes.
+    assert not renders_key_bytes_strictly(raw.hex(".", 3)[1:])
+    assert not renders_key_bytes_strictly("0" + raw.hex(".", 3))
+
+
+def test_base64_in_an_alphabet_the_caller_chose_is_still_a_key() -> None:
+    """``b64encode(raw, altchars=b"~!")`` is reversible by anyone holding those two.
+
+    The two alphabets this module knew — standard and url-safe — are just the two
+    that have names. ``altchars`` is two arbitrary bytes, so there are thousands of
+    alphabets and enumerating them was never going to work; what is fixed is the
+    other sixty-two characters, and the shape: 43 characters of which at most two
+    are not letters or digits.
+
+    THIS IS A DEGENERATE TEST AND IT STAYS WHERE THEY LIVE. The second half of this
+    asserts the containment: a whole value a caller handed over, never a hostname
+    label, never a join.
+    """
+    import base64
+
+    from sikkerfil.links import (
+        opaque_carries_key_material,
+        origin_of,
+        quoted,
+        renders_key_bytes,
+        renders_key_bytes_strictly,
+    )
+
+    raw = b"?" * 32  # the payload whose standard base64 is all "/"
+    for altchars in (b"~!", b"$%", b"()", b"*,", b"+/", b"-_"):
+        spelling = base64.b64encode(raw, altchars=altchars).decode()
+        assert base64.b64decode(spelling, altchars=altchars) == raw, altchars
+        assert renders_key_bytes(spelling), altchars
+        assert opaque_carries_key_material(spelling), altchars
+        assert "not repeated" in quoted(spelling), altchars
+        # It is NOT strict, which is what keeps it out of the path and host scans.
+        assert not renders_key_bytes_strictly(spelling), altchars
+
+    # THE COST, MEASURED, and asserted rather than described. Of 120,003 real
+    # filenames on this machine, 87 — 0.073% — are 43 characters with at most two
+    # kinds of punctuation in them, and "gnome-mime-application-x-compressed-tar.svg"
+    # is one of them. That is the same order as the 0.085% the base85 test already
+    # costs, which is the line round twenty-one drew and this is staying inside.
+    #
+    # The slots that ask this question are name, content_type and password — a value
+    # a caller typed, where a refusal by name costs them a retype. send(filename=)
+    # does not ask it, so the filename above still sends; that is measured here
+    # rather than assumed, because the list of slots is the whole cost.
+    from sikkerfil.errors import TransportError
+
+    assert opaque_carries_key_material("gnome-mime-application-x-compressed-tar.svg")
+    with contextlib.suppress(TransportError):
+        Sikkerfil(
+            api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9"
+        ).send(b"hello", filename="gnome-mime-application-x-compressed-tar.svg")
+
+    # The width this buys is real and it is the width every degenerate test has: a
+    # 43-character value with punctuation in it. What it must not touch is a name.
+    assert origin_of("https://private.secure.files.company.internal.example.com/x") != ""
+    for ordinary in ("kvartalsrapport-2026-q3", "hemmelig-passord-2026", "text/csv"):
+        assert not opaque_carries_key_material(ordinary), ordinary
+    # AND THE MEDIA TYPES, ASKED WHERE THEY ARE ACTUALLY ASKED. content_type does not
+    # go through opaque_carries_key_material — a registered subtype is a 38-character
+    # run and the run threshold refuses it, which is why _is_a_content_type reads the
+    # RFC 6838 grammar and looks at the tokens instead. The new test must not creep
+    # into that path either.
+    from sikkerfil.client import _is_a_content_type
+
+    for registered in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.anser-web-certificate-issue-initiation",
+        "application/tamp-community-update-confirm",
+        "text/csv",
+    ):
+        assert _is_a_content_type(registered), registered
+
+
+def test_a_path_with_many_components_is_answered_promptly() -> None:
+    """A SCAN THAT TAKES TWENTY-FIVE SECONDS IS A BROKEN CALL, not a safe one.
+
+    The subsequence pass joined and tested every contiguous run — quadratically many
+    runs, each join linear — so ``send("/".join(["a"] * 1600))`` sat for 25 seconds
+    before it could say "no such file". A strict rendering of 32 bytes has a known
+    length, so a run past the longest one cannot become one by growing; the scan has
+    a ceiling now, and this asserts the ceiling at the call site rather than on the
+    predicate that has it.
+    """
+    import time
+
+    from sikkerfil.links import path_carries_key_material
+
+    client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9")
+    # Up to what a path can actually be: PATH_MAX is 4096, so 1600 two-character
+    # components is near the longest path an operating system will carry — and it is
+    # the length that took twenty-five seconds.
+    for count in (400, 1000, 1600):
+        missing = "/" + "/".join(["a"] * count)
+        started = time.perf_counter()
+        with pytest.raises(ConfigurationError, match="no such file"):
+            client.send(missing)
+        spent = time.perf_counter() - started
+        assert spent < 5.0, f"{count} components took {spent:.1f}s"
+
+    # And the thing the scan is FOR still works, at the same ceiling.
+    raw = bytes(range(32))
+    assert path_carries_key_material("/tmp/" + raw.hex("/"))
+    assert path_carries_key_material("/tmp/" + raw.hex("/", 3))
+    assert not path_carries_key_material("/home/me/Downloads/kvartalsrapport-2026-q3.pdf")
