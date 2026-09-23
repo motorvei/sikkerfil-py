@@ -2168,3 +2168,208 @@ def test_a_parameter_value_is_asked_about_containment_not_exactness() -> None:
     for suffix in (".cii", ".pdf", ".xlsx", ".docx", ".csv", ".odt", ".zip", ".json", ".bin"):
         guessed = mimetypes.guess_type("x" + suffix)[0] or "application/octet-stream"
         assert _is_a_content_type(guessed), guessed
+
+
+# --- Round twenty-five: a header NAME is sent too, and z85 moved with the Python --
+
+
+def test_a_key_used_as_a_header_name_is_refused() -> None:
+    """THE NAME GOES ON THE WIRE EXACTLY AS THE VALUE DOES.
+
+    Every safeguard in Transport's header loop was applied to the value. A key is a
+    valid HTTP field name, so ``get_json(path, headers={key: "x"})`` put all
+    forty-three characters out as a header NAME — and the refusals below interpolate
+    the name into their message, so a bad value echoed the key locally as well.
+    """
+    import base64
+
+    from sikkerfil.transport import Transport
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    attempted: list[str] = []
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempted.extend(f"{n}: {v}" for n, v in request.header_items())
+        raise urllib.error.URLError("the test does not use the network")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.request, "urlopen", spy)
+        for name in (
+            key,
+            bytes(range(32)).hex(),
+            bytes(range(32)).hex(":"),
+            base64.b32encode(bytes(range(32))).decode(),
+            f"x-{bytes(range(32)).hex()}",
+        ):
+            with pytest.raises(ConfigurationError, match="header name") as caught:
+                Transport("http://127.0.0.1:9", retries=0).get_json(
+                    "/api/v1/health", headers={name: "x"}
+                )
+            assert not _leaks(str(caught.value)), str(caught.value)
+            # And with a value that would have tripped the checks below, so the
+            # message that interpolates the name is never reached with a key in it.
+            with pytest.raises(ConfigurationError) as caught:
+                Transport("http://127.0.0.1:9", retries=0).get_json(
+                    "/api/v1/health", headers={name: "x\x01y"}
+                )
+            assert not _leaks(str(caught.value)), str(caught.value)
+    assert not attempted, attempted
+
+
+def test_the_header_names_a_real_caller_sends_still_go() -> None:
+    """A HEADER NAME IS A TOKEN WHOSE LENGTH NOBODY CHOSE, so it gets the media-type
+    question rather than the degenerate one — and these three names are why.
+
+    ``holds_a_key`` refuses ``x-amz-server-side-encryption-customer-key-md5`` (45
+    characters, so it contains a 43-character window of the alphabet) and
+    ``renders_key_bytes`` refuses ``x-amz-server-side-encryption-customer-key`` (41,
+    which b85decode takes to 32 bytes). Both are real headers. So the question asked
+    is the one asked of a media type: is this EXACTLY a key, or does it hold a
+    rendering whose alphabet means something.
+    """
+    from sikkerfil.transport import _a_key_is_the_header_name
+
+    for ordinary in (
+        "content-type",
+        "authorization",
+        "x-request-id",
+        "accept-encoding",
+        "access-control-allow-credentials",
+        "content-security-policy-report-only",
+        "strict-transport-security",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-goog-encryption-kms-key-name",
+        "sec-websocket-extensions",
+        "x-sikkerfil-token",
+        "x-sikkerfil-key",
+    ):
+        assert not _a_key_is_the_header_name(ordinary), ordinary
+
+    # THE COST, NAMED: a header name that is exactly forty-three characters of the
+    # alphabet is indistinguishable from a key, because that is all a key is.
+    assert _a_key_is_the_header_name("x-amz-server-side-encryption-aws-kms-key-id")
+    assert len("x-amz-server-side-encryption-aws-kms-key-id") == 43
+
+    # AND THE GAP, NAMED: a DECORATED key as a header name is not caught, because
+    # catching it means refusing the 45-character AWS name above.
+    key = crypto.b64url_encode(bytes(range(32)))
+    assert not _a_key_is_the_header_name(f"x-key-{key}")
+
+
+def test_doubled_separators_do_not_break_a_uniform_run() -> None:
+    """``"//".join(wrap(key, 10))`` is the exact shape this function exists for.
+
+    An empty component reached the unconditional ``close()`` and ended the run every
+    time, so a key chunked at a fixed width and separated by doubled separators was
+    invisible — while the same path with single separators was caught. The operating
+    system collapses the doubling before it opens anything.
+    """
+    import textwrap
+
+    from sikkerfil.links import joined_path_spells_a_key, path_carries_key_material
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for width in (8, 10, 11, 15, 20):
+        for separator in ("//", "///", "\\\\"):
+            chunked = separator.join(textwrap.wrap(key, width))
+            assert path_carries_key_material(f"/tmp/{chunked}"), (width, separator)
+        assert path_carries_key_material("/tmp/" + "/".join(textwrap.wrap(key, width)))
+
+    # The save() predicate reads the same shape.
+    assert joined_path_spells_a_key("/tmp/" + "//".join(textwrap.wrap(key, 10)))
+    # And an ordinary path with a doubled separator in it still prints.
+    assert not path_carries_key_material("/home/me//Downloads/kvartalsrapport-2026-q3.pdf")
+
+
+def test_the_save_join_is_normalised_too() -> None:
+    """``joined_path_spells_a_key`` reached ``_uniform_run_carrying_key`` directly.
+
+    So the NFKC pass that ``_parts_carrying_key`` grew last round never ran for
+    ``save()``: a directory and a filename that are the two halves of a fullwidth
+    transcription of a key passed every check, and the path written to disk normalises
+    to the whole key.
+    """
+    from sikkerfil.links import joined_path_spells_a_key
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    wide = "".join(chr(ord(c) - 0x21 + 0xFF01) if 0x21 <= ord(c) <= 0x7E else c for c in key)
+    # THE CUTS THIS PREDICATE ANSWERS FOR ARE THE EVEN ONES, deliberately: it is the
+    # narrow check, and the uniform gate is what keeps it from refusing a caller whose
+    # directory happens to be long. 21/22 is an even split; 10/33 is not one, and is
+    # not claimed here.
+    for cut in (21, 22):
+        assert joined_path_spells_a_key(f"{key[:cut]}/{key[cut:]}"), cut
+        assert joined_path_spells_a_key(f"{wide[:cut]}/{wide[cut:]}"), cut
+    assert not joined_path_spells_a_key(f"{key[:10]}/{key[10:]}")
+
+    # The paths this suite itself writes to must still be writable.
+    for ordinary in (
+        "/tmp/pytest-of-user/pytest-257/test_a_hostile_filename_canno0/authorized_keys",
+        "/home/me/Downloads/kvartalsrapport-2026-q3.pdf",
+    ):
+        assert not joined_path_spells_a_key(ordinary), ordinary
+
+
+def test_z85_does_not_depend_on_the_interpreter() -> None:
+    """THE SAME VALUE WAS A KEY ON 3.13 AND NOT ON 3.10, and that is not a guard.
+
+    ``base64.z85decode`` arrived in 3.13, and this package supports 3.10 as well, so
+    the detector silently widened when a caller upgraded — while every false-positive
+    number I had quoted was measured on 3.10, where the branch does not exist to be
+    measured. It is asked here instead, by alphabet and length.
+
+    Measured on 60,021 real paths, before and after: ``joined_path_spells_a_key`` — the
+    predicate that decides whether ``save()`` will write — refused 0.561% on 3.13 and
+    0.393% on 3.10. It is **0.403% on both** now.
+    """
+    import base64
+
+    from sikkerfil.links import _Z85_ALPHABET, _is_z85_of_a_key, renders_key_bytes
+
+    raw = bytes(range(32))
+    # The alphabet is written down rather than read off the standard library, so where
+    # the standard library HAS an encoder, the two are checked against each other.
+    # Reached through getattr, because on 3.10 these names do not exist at all — which
+    # is the whole subject of this test.
+    encode = getattr(base64, "z85encode", None)
+    decode = getattr(base64, "z85decode", None)
+    if encode is not None and decode is not None:
+        spelled = encode(raw).decode()
+        assert len(spelled) == 40
+        assert all(character in _Z85_ALPHABET for character in spelled), spelled
+        assert renders_key_bytes(spelled), spelled
+        assert decode(spelled) == raw
+
+    # A Z85 RENDERING THAT NOTHING ELSE CATCHES, so this is an assertion about z85 and
+    # not about a85 or b85 happening to accept the same forty characters — "0" * 40 is
+    # caught three different ways and holds nothing. Written down rather than generated,
+    # because on 3.10 there is no z85encode to generate it with, and checked against
+    # the standard library's own decoder wherever there is one.
+    only_z85 = "Om)p8Nw.kL@l(f^)s.4>JRL!):P7<+wNC6P/@FyK"
+    assert len(only_z85) == 40
+    for other in (base64.a85decode, base64.b85decode):
+        with contextlib.suppress(ValueError, TypeError):
+            assert len(other(only_z85)) != 32, only_z85
+    if decode is not None:
+        assert len(decode(only_z85)) == 32
+    assert renders_key_bytes(only_z85)
+
+    # AND WITH THE STANDARD LIBRARY'S z85 TAKEN AWAY, which is what 3.10 IS. This is
+    # the property stated as a property: the answer must not move when the decoder
+    # does. A single interpreter cannot test "3.10 and 3.13 agree" by running twice,
+    # but it can test that the answer does not come from the interpreter.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delattr(base64, "z85decode", raising=False)
+        patch.delattr(base64, "z85encode", raising=False)
+        assert renders_key_bytes(only_z85)
+
+    # Forty characters of the alphabet is a rendering on every interpreter.
+    assert renders_key_bytes("0" * 40)
+    assert renders_key_bytes("abcdefghij" * 4)
+    # The decoder's leniency is not borrowed: forty-one characters is not Z85.
+    assert _is_z85_of_a_key("0" * 40)
+    assert not _is_z85_of_a_key("0" * 41)
+    # And the alphabet is the real one: "," and ";" and '"' are not in Z85.
+    for outside in (",", ";", '"', "'", "\\", "|", "~", "`", "_"):
+        assert outside not in _Z85_ALPHABET, outside

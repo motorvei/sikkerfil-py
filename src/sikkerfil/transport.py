@@ -64,6 +64,7 @@ from urllib.parse import urlsplit
 
 import certifi
 
+from . import links
 from .errors import (
     ApiError,
     AuthenticationError,
@@ -259,6 +260,33 @@ class Transport:
         # sikkerfil_sk_… or base64url — so a value that is not is a caller mistake,
         # and it is refused by NAME rather than by value.
         for name, value in headers.items():
+            # THE NAME IS SENT TOO, and every safeguard below was applied only to the
+            # value. A key is a valid HTTP field name — get_json(path, headers={key:
+            # "x"}) put all forty-three characters on the wire as a header NAME, and
+            # the refusals further down interpolate the name into their message, so a
+            # bad value echoed the key locally as well. Transport is public; a caller
+            # building headers from a dict they assembled can invert a pair.
+            #
+            # THE MEDIA-TYPE PREDICATE, NOT THE DEGENERATE ONE, and the numbers chose
+            # it. A header name is a registered token whose length nobody picked, so a
+            # length test has nothing to say about it: holds_a_key refuses
+            # x-amz-server-side-encryption-customer-key-md5, and renders_key_bytes
+            # refuses x-amz-server-side-encryption-customer-key — the second on 3.13
+            # only, which is the interpreter-dependence fixed in the same round. What
+            # is asked is what a media type is asked: is this EXACTLY a key, or does
+            # it hold a rendering whose alphabet means something.
+            #
+            # The gap, named rather than found later: a key with DECORATION on it as a
+            # header name — "x-key-<a key>" — is not caught, because catching it means
+            # refusing the AWS names above. A bare key is the mistake that happens.
+            if _a_key_is_the_header_name(name):
+                raise ConfigurationError(
+                    "a header name given carries what looks like a decryption key. A "
+                    "header name is sent to the service exactly as a value is, so a "
+                    "key used as one is handed to the party that must never hold it. "
+                    "The key belongs after '#k=' in a link. The name is not repeated "
+                    "here, and nothing was sent."
+                )
             # ASCII IS NOT ENOUGH, which is where the first version of this stopped.
             # CR and LF are ASCII, so a credential wrapped across two lines in a
             # config file sailed through — and then http.client's own validation
@@ -453,3 +481,18 @@ def _retry_after(headers: Mapping[str, str]) -> int:
         return int(headers.get("retry-after", "3600"))
     except ValueError:
         return 3600
+
+
+def _a_key_is_the_header_name(name: str) -> bool:
+    """Whether an HTTP field name is a key, or holds a rendering with an alphabet.
+
+    Deliberately the same question ``_a_key_hides_in`` asks of a media type's tokens,
+    for the same reason: both are names whose length somebody else chose, so "forty
+    characters" and "forty-three characters" say nothing about them. See the comment
+    at the call site for the two real header names that proved it.
+    """
+    return (
+        links.spells_a_key_exactly(name)
+        or links.renders_key_bytes_strictly(name)
+        or links.renders_key_bytes_strictly_inside(name)
+    )

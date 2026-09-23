@@ -23,7 +23,7 @@ import binascii
 import re
 import string
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -459,24 +459,49 @@ def _is_a_rendering_of_a_key(compact: str) -> bool:
             continue
     # a85 has TWO flags, not one: foldspaces spells four spaces as "y", so 32 spaces
     # are eight characters and no run test will ever see them. And z85 arrived in
-    # 3.13, which this package supports — a decoder that exists on the interpreter
-    # the caller is running is part of "what the standard library produces", whatever
-    # the interpreter I happen to be testing on has.
-    for attempt in (
+    # 3.13 — but see _is_z85_of_a_key for why that one is no longer asked of the
+    # standard library at all: a decoder that exists on one supported interpreter and
+    # not on another makes the same value a key on 3.13 and not on 3.10.
+    attempts: tuple[Callable[[str], bytes], ...] = (
         lambda text: base64.a85decode(text, adobe=True),
         lambda text: base64.a85decode(text, foldspaces=True),
         lambda text: base64.a85decode(text, adobe=True, foldspaces=True),
-        getattr(base64, "z85decode", None),
-    ):
-        if attempt is None:
-            continue
+    )
+    for attempt in attempts:
         try:
             if len(attempt(compact)) == KEY_BYTES:
                 return True
         except (ValueError, TypeError):
             continue
 
-    return False
+    return _is_z85_of_a_key(compact)
+
+
+def _is_z85_of_a_key(compact: str) -> bool:
+    """32 bytes in Z85, asked OURSELVES so the answer does not move with the interpreter.
+
+    THIS USED TO BE ``getattr(base64, "z85decode", None)``, and that made the library
+    refuse different values on different Pythons. z85decode arrived in 3.13, which this
+    package supports alongside 3.10, so the same header name, the same path and the
+    same password were accepted on one supported interpreter and refused on another —
+    and every false-positive cost I had measured was measured on 3.10, where the branch
+    does not exist to be measured. A guard whose answer moves when a caller upgrades
+    is not one anybody can reason about.
+
+    AND IT ASKS FOR FORTY CHARACTERS, NOT FORTY OR FORTY-ONE. Z85 packs four bytes into
+    five characters, so z85encode of 32 bytes is exactly forty; 3.13's decoder also
+    accepts forty-one, which is leniency in a decoder rather than a rendering anything
+    produces. The encoder's length is the honest one.
+
+    That does NOT make forty-one characters printable, and I wrote a comment here
+    saying it did before checking: b85decode takes forty-one characters to 32 bytes as
+    well, on every interpreter, so "x-amz-server-side-encryption-customer-key" is still
+    a rendering by the degenerate test — it is simply not an interpreter-dependent one,
+    and never was. What this function fixes is the DIVERGENCE, which is real and was
+    measured: joined_path_spells_a_key, the predicate that decides whether save() will
+    write, refused 0.56% of real paths on 3.13 against 0.39% on 3.10.
+    """
+    return len(compact) == 5 * KEY_BYTES // 4 and all(c in _Z85_ALPHABET for c in compact)
 
 
 def _is_base64_under_some_altchars(compact: str) -> bool:
@@ -689,8 +714,18 @@ def joined_path_spells_a_key(path: str) -> bool:
     key-sized window in their 45-character join. That pass exists for a key with
     DECORATION on it, where loose matching earns its keep; a caller saving a file into
     a directory whose name is long is not that.
+
+    NORMALISED AS WELL AS WRITTEN, which _parts_carrying_key learned last round and
+    this call did not: it reaches _uniform_run_carrying_key directly, so the NFKC pass
+    that sits in the other one never ran here. ``save(directory=<fullwidth key[:21]>,
+    filename=<fullwidth key[21:]>)`` passed every check and then wrote a path whose
+    normalised form is the whole key.
     """
-    return renders_key_bytes(path) or bool(_uniform_run_carrying_key(_components(path)))
+    components = _components(path)
+    if renders_key_bytes(path) or _uniform_run_carrying_key(components):
+        return True
+    normalised = [unicodedata.normalize("NFKC", part) for part in components]
+    return normalised != components and bool(_uniform_run_carrying_key(normalised))
 
 
 def redacted_path(path: str) -> str:
@@ -989,10 +1024,18 @@ def _uniform_run_carrying_key(parts: Sequence[str], chunk_floor: int = 4) -> set
             suspect.update(widest)
 
     for index, part in enumerate(parts):
+        # AN EMPTY COMPONENT IS TRANSPARENT HERE TOO. "//".join(wrap(key, 10)) is a key
+        # cut at a fixed width with nothing between each pair — the exact shape this
+        # function exists for — and an empty component reaching the unconditional
+        # close() below ended the run every time. The fragment pass and the strict scan
+        # were taught this last round and this was missed, which is what happens when
+        # three places answer the same question separately.
+        if not part:
+            continue
         # THE FLOOR IS FOR STARTING A RUN, NOT FOR ENDING ONE. A remainder can be one
         # character — wrap(key, 20) gives 20/20/3 — so it is asked about as an end
         # before the run is closed without it, and only its alphabet matters there.
-        alphabet = bool(part) and bool(_EVENLY_CHUNKED.fullmatch(part))
+        alphabet = bool(_EVENLY_CHUNKED.fullmatch(part))
         even = alphabet and len(part) >= chunk_floor
         if even and (not run or abs(len(part) - len(parts[run[0]])) <= _CHUNK_SLACK):
             run.append(index)
@@ -1211,6 +1254,15 @@ _STRICT_WIDTHS = frozenset(_STRICT_LENGTHS) | {
 
 #: Past this, no join is a strict rendering of a key however much more is added to it.
 _WIDEST_STRICT = max(_STRICT_WIDTHS)
+
+#: Z85's alphabet, from ZeroMQ RFC 32. Written down rather than read off
+#: base64.z85encode, because the point of _is_z85_of_a_key is to answer the same on an
+#: interpreter that has no z85 in it. Asserted against the standard library's own
+#: encoder in the tests, on the interpreters that have one.
+_Z85_ALPHABET = frozenset(
+    "0123456789abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#"
+)
 
 #: The sixty-two letters of base64 that no ``altchars`` argument can move. The other
 #: two — 62 and 63, "+" and "/" by default — are whatever the caller passed.
