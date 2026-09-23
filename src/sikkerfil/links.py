@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
-from .crypto import KEY_BYTES, b64url_decode, key_text
+from .crypto import key_text
 from .errors import ConfigurationError
 
 #: The service's own id alphabet — uppercase and digits, 4 to 32 characters.
@@ -83,7 +83,7 @@ def parse_link(link: str) -> ParsedLink:
         if SHARE_NAME.match(head):
             return ParsedLink(origin="", share_id=None, name=head, key=key)
         raise ConfigurationError(
-            f"{describe(head)}. A share id is {SHARE_ID.pattern} and a named "
+            f"{_describe(head)}. A share id is {SHARE_ID.pattern} and a named "
             f"link is {SHARE_NAME.pattern}"
         )
 
@@ -106,7 +106,7 @@ def parse_link(link: str) -> ParsedLink:
         return ParsedLink(origin=origin, share_id=None, name=path, key=key)
 
     raise ConfigurationError(
-        f"{redacted(link)} does not look like a share link — {describe(path)}. "
+        f"{redacted(link)} does not look like a share link — {_describe(path)}. "
         "Expected https://sikkerfil.no/s/<id>#k=<key> or "
         "https://sikkerfil.no/<name>#k=<key>"
     )
@@ -174,14 +174,13 @@ def redacted(link: str) -> str:
     sender who kept the id and the key separately and pasted the wrong one.
     Stripping only the fragment left that case fully exposed.
     """
-    origin = link.partition("#")[0].partition("://")
-    if not origin[1]:
+    scheme, separator, rest = link.partition("#")[0].partition("://")
+    if not separator:
         return "<unrecognised>"
-    host = origin[2].partition("/")[0]
-    return f"{origin[0]}://{host}/<unrecognised>"
+    return f"{scheme}://{rest.partition('/')[0]}/<unrecognised>"
 
 
-def describe(value: str) -> str:
+def _describe(value: str) -> str:
     """Name a value we did not recognise, WITHOUT repeating it.
 
     We are here because it is not an id, a name or a link, so we do not know what
@@ -193,7 +192,7 @@ def describe(value: str) -> str:
     so, which is the most useful thing it could say to the caller who got here
     that way.
     """
-    if looks_like_a_key(value):
+    if _looks_like_a_key(value):
         return (
             "that value is a decryption key, not a share id or a name. The key "
             "goes in key= alongside the id — receive(id, key=…) — or after #k= "
@@ -202,9 +201,18 @@ def describe(value: str) -> str:
     return f"a {len(value)}-character value that is not repeated here, in case it is a key"
 
 
-def looks_like_a_key(value: str) -> bool:
-    """Whether ``value`` decodes to something exactly key-sized."""
+def _looks_like_a_key(value: str) -> bool:
+    """Whether ``value`` is a key, BY THE LIBRARY'S ONE DEFINITION OF THAT.
+
+    Asking key_text rather than re-deriving the test is the point. The first
+    version of this did its own ``.strip()`` and length check, and promptly
+    disagreed with key_text: a key wrapped across two lines was accepted there
+    and not recognised as a key here, so the message told a caller their key was
+    "a 44-character value". Two places deciding the same question is the bug;
+    keeping them in step is not a fix.
+    """
     try:
-        return len(b64url_decode(value.strip())) == KEY_BYTES
-    except (TypeError, ValueError):
+        key_text(value)
+    except ConfigurationError:
         return False
+    return True

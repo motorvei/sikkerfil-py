@@ -218,3 +218,28 @@ def test_removing_whitespace_cannot_manufacture_a_valid_key(not_a_key: str) -> N
     """
     with pytest.raises(ConfigurationError):
         crypto.key_text(not_a_key)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        KEY,
+        KEY + "=",
+        KEY + "\n",
+        KEY[:20] + "\n" + KEY[20:],  # wrapped — the case the two definitions differed on
+        " ".join(KEY[i : i + 4] for i in range(0, len(KEY), 4)),
+    ],
+)
+def test_a_key_in_the_wrong_place_is_named_as_a_key_however_it_is_spelled(
+    spelling: str,
+) -> None:
+    """Whatever key_text accepts, the error message must recognise as a key.
+
+    These were two separate decisions and they disagreed: key_text took a key
+    wrapped across two lines, and the message's own check — its own .strip() and
+    length test — did not, so it told the caller their key was "a 44-character
+    value". The check now asks key_text instead of re-deriving the answer, which
+    is why this is parametrised over every spelling key_text takes.
+    """
+    with pytest.raises(ConfigurationError, match="is a decryption key"):
+        parse_link(spelling)
