@@ -35,7 +35,7 @@ import os
 from pathlib import Path
 from typing import IO, Any, Union
 
-from . import crypto
+from . import crypto, links
 from .errors import (
     ApiError,
     ConfigurationError,
@@ -453,6 +453,27 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
     if isinstance(source, (str, os.PathLike)):
         path = Path(source).expanduser()
         if not path.is_file():
+            # A KEY PASTED WHERE A FILENAME GOES is a sender-side mix-up like any
+            # other, and this echoed whatever it was given. Unlike a link, a path
+            # MUST usually be echoable — "no such file" without the name is
+            # useless — and the two needs settle themselves on the shape of the
+            # values: '/' is not in the base64url alphabet, so any path that keeps
+            # a directory through normalisation can never look like a key and is
+            # always named. Only a bare basename that is exactly key-shaped is
+            # withheld, and then the DIRECTORY is named instead, which is the
+            # diagnostic half of the message anyway.
+            #
+            # "Pass an absolute path" is the escape hatch, and it is what works:
+            # Path("./name") NORMALISES BACK to "name", so the obvious advice to
+            # add "./" would have been false. Tested, because the first version of
+            # this message gave exactly that advice.
+            if links.looks_like_a_key(str(path)):
+                raise ConfigurationError(
+                    f"no such file in {str(path.resolve().parent)!r}. The name is "
+                    "not repeated here: it is exactly the shape of a decryption "
+                    "key, and an error message ends up in a log. If that really is "
+                    "the filename, pass it as an absolute path and it will be named."
+                )
             raise ConfigurationError(f"no such file: {path}")
         return path.read_bytes(), path.name
     if hasattr(source, "read"):

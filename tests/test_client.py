@@ -376,3 +376,43 @@ def test_a_key_pasted_with_whitespace_still_opens_the_file(
     """
     sent = client.send(PLAINTEXT, filename="rapport.pdf")
     assert client.receive(sent.id, key=sent.key + trailing).data == PLAINTEXT
+
+
+def test_a_key_shaped_filename_is_not_echoed_but_the_directory_is(
+    client: Sikkerfil, tmp_path, monkeypatch
+) -> None:
+    """A path must normally be echoable; a key must never be. They settle on shape.
+
+    '/' is not in the base64url alphabet, so any path that keeps a directory
+    through normalisation cannot look like a key and is named in full. Only a bare
+    key-shaped basename is withheld — and then the directory is named instead,
+    which is the half of "no such file" that actually helps.
+    """
+    monkeypatch.chdir(tmp_path)
+    key_shaped = crypto.b64url_encode(bytes(range(32)))
+
+    with pytest.raises(ConfigurationError) as caught:
+        client.send(key_shaped)
+    message = str(caught.value)
+    assert key_shaped[:12] not in message, message
+    assert str(tmp_path) in message, "it did not say where it looked"
+
+
+def test_the_absolute_path_escape_hatch_is_real(client: Sikkerfil, tmp_path) -> None:
+    """The first version of that message advised './name', which does not work.
+
+    Path("./name") normalises straight back to "name", so the advice would have
+    been false for the one person it was written for — someone whose file really is
+    named like a key. An absolute path survives normalisation, so it is named.
+    """
+    key_shaped = crypto.b64url_encode(bytes(range(32)))
+    absolute = tmp_path / key_shaped
+
+    with pytest.raises(ConfigurationError) as caught:
+        client.send(str(absolute))
+    assert key_shaped in str(caught.value), "the escape hatch does not work"
+
+    # And the advice that was wrong stays wrong, so nobody reinstates it.
+    with pytest.raises(ConfigurationError) as caught:
+        client.send(f"./{key_shaped}")
+    assert key_shaped[:12] not in str(caught.value), "'./' does not escape normalisation"

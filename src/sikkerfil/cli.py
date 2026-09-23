@@ -28,7 +28,7 @@ from collections.abc import Sequence
 from . import __version__
 from .client import Sikkerfil, _client_for
 from .errors import ConfigurationError, SikkerfilError
-from .links import DEFAULT_MARKET, MARKETS
+from .links import DEFAULT_MARKET, MARKETS, quoted
 
 _DURATION = re.compile(r"^(\d+)\s*([smhdw]?)$", re.IGNORECASE)
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "": 1}
@@ -39,7 +39,7 @@ def duration(text: str) -> int:
     match = _DURATION.match(text.strip())
     if not match:
         raise argparse.ArgumentTypeError(
-            f"{text!r} is not a duration; use 3600, 30m, 24h or 7d"
+            f"{quoted(text)} is not a duration; use 3600, 30m, 24h or 7d"
         )
     return int(match.group(1)) * _UNITS[match.group(2).lower()]
 

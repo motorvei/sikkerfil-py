@@ -101,7 +101,7 @@ def parse_link(link: str) -> ParsedLink:
         ) from None
 
     if parts.scheme not in ("https", "http"):
-        raise ConfigurationError(f"a share link must be https; got {_quoted(parts.scheme)}")
+        raise ConfigurationError(f"a share link must be https; got {quoted(parts.scheme)}")
     origin = f"{parts.scheme}://{parts.netloc}"
     key = _key_from_fragment(parts.fragment)
 
@@ -164,7 +164,7 @@ def base_url_for(market: str) -> str:
     origin = MARKETS.get(market.strip().lower())
     if origin is None:
         raise ConfigurationError(
-            f"unknown market {_quoted(market)}; expected one of {', '.join(sorted(MARKETS))}"
+            f"unknown market {quoted(market)}; expected one of {', '.join(sorted(MARKETS))}"
         )
     return origin
 
@@ -210,7 +210,7 @@ def origin_of(link: str) -> str:
         host, port = parts.hostname, parts.port
     except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
         return ""
-    if not parts.scheme or not host or _looks_like_a_key(host):
+    if not parts.scheme or not host or looks_like_a_key(host):
         return ""
     return f"{parts.scheme}://{host}{f':{port}' if port else ''}"
 
@@ -243,7 +243,7 @@ def _describe(value: str) -> str:
     so, which is the most useful thing it could say to the caller who got here
     that way.
     """
-    if _looks_like_a_key(value):
+    if looks_like_a_key(value):
         return (
             "that value is a decryption key, not a share id or a name. The key "
             "goes in key= alongside the id — receive(id, key=…) — or after #k= "
@@ -252,7 +252,7 @@ def _describe(value: str) -> str:
     return f"a {len(value)}-character value that is not repeated here, in case it is a key"
 
 
-def _quoted(value: str) -> str:
+def quoted(value: str) -> str:
     """``repr(value)`` — unless it might be a key, in which case it is not echoed.
 
     THE RULE, APPLIED WITHOUT EXCEPTION rather than site by site. Four reviews in
@@ -266,10 +266,10 @@ def _quoted(value: str) -> str:
     and anything key-shaped does not come out. Guessing which slots a key can
     reach has now failed four times; refusing to echo one from any slot cannot.
     """
-    return "<a key, not repeated here>" if _looks_like_a_key(value) else repr(value)
+    return "<a key, not repeated here>" if looks_like_a_key(value) else repr(value)
 
 
-def _looks_like_a_key(value: str) -> bool:
+def looks_like_a_key(value: str) -> bool:
     """Whether ``value`` is a key, BY THE LIBRARY'S ONE DEFINITION OF THAT.
 
     Asking key_text rather than re-deriving the test is the point. The first
