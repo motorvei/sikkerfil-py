@@ -45,7 +45,7 @@ MARKETS = {
 DEFAULT_MARKET = "no"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ParsedLink:
     """A share link, taken apart. ``key`` is present only if the link carried one."""
 
@@ -61,6 +61,20 @@ class ParsedLink:
     def reference(self) -> str:
         """Whichever of id or name this link carried. Never empty."""
         return self.share_id or self.name or ""
+
+    def __repr__(self) -> str:
+        """Without the key.
+
+        THE OBJECT PARSING PRODUCES, and the one I missed when I masked the other
+        three. ``log.debug("parsed %s", parse_link(url))`` is at least as ordinary
+        a line as logging a SentShare, and the generated repr printed the key
+        field in full. Masking the results of parsing and not the result of THE
+        parse function was an oversight, not a distinction.
+        """
+        return (
+            f"ParsedLink(origin={self.origin!r}, share_id={self.share_id!r}, "
+            f"name={self.name!r}, key={'<hidden>' if self.key else None})"
+        )
 
 
 def parse_link(link: str) -> ParsedLink:
@@ -83,7 +97,7 @@ def parse_link(link: str) -> ParsedLink:
         if SHARE_NAME.match(head):
             return ParsedLink(origin="", share_id=None, name=head, key=key)
         raise ConfigurationError(
-            f"{_describe(head)}. A share id is {SHARE_ID.pattern} and a named "
+            f"{describe(head)}. A share id is {SHARE_ID.pattern} and a named "
             f"link is {SHARE_NAME.pattern}"
         )
 
@@ -91,18 +105,29 @@ def parse_link(link: str) -> ParsedLink:
     # ValueError("Invalid IPv6 URL"). Letting that out breaks this function's one
     # promise, which is that something it will not accept comes back as a
     # ConfigurationError; a caller catching SikkerfilError would miss it entirely.
+    # The same two-step as crypto.key_text, for the same reason: urlsplit's
+    # ValueError message contains the rejected authority, and `from None` would
+    # leave it on __context__ with a clean message in front of it.
+    parts = None
     try:
         parts = urlsplit(text)
     except ValueError:
+        parts = None
+    if parts is None:
         raise ConfigurationError(
             "that address could not be parsed as a URL. Expected "
             "https://sikkerfil.no/s/<id>#k=<key>. It is not repeated here, in "
             "case any part of it is a key."
-        ) from None
+        )
 
     if parts.scheme not in ("https", "http"):
         raise ConfigurationError(f"a share link must be https; got {quoted(parts.scheme)}")
-    origin = f"{parts.scheme}://{parts.netloc}"
+    # FROM THE HOSTNAME, NOT netloc. netloc carries "user:password@", and this
+    # origin is not just for display — _client_for installs it as base_url, so a
+    # credential here would go into every request URL and come back out of any
+    # transport failure. The redaction path stopped using netloc two commits ago;
+    # the OPERATIONAL path was still building from it.
+    origin = origin_of(text)
     key = _key_from_fragment(parts.fragment)
 
     path = parts.path.strip("/")
@@ -112,7 +137,7 @@ def parse_link(link: str) -> ParsedLink:
             # A KEY PASTED WHERE THE ID GOES, on the canonical share path. This
             # echoed the candidate, so the most ordinary link shape there is was
             # the one that reproduced a key in full.
-            raise ConfigurationError(f"{_describe(candidate)}. A share id is {SHARE_ID.pattern}")
+            raise ConfigurationError(f"{describe(candidate)}. A share id is {SHARE_ID.pattern}")
         return ParsedLink(origin=origin, share_id=candidate, name=None, key=key)
 
     if SHARE_ID.match(path):
@@ -121,7 +146,7 @@ def parse_link(link: str) -> ParsedLink:
         return ParsedLink(origin=origin, share_id=None, name=path, key=key)
 
     raise ConfigurationError(
-        f"{redacted(link)} does not look like a share link — {_describe(path)}. "
+        f"{redacted(link)} does not look like a share link — {describe(path)}. "
         "Expected https://sikkerfil.no/s/<id>#k=<key> or "
         "https://sikkerfil.no/<name>#k=<key>"
     )
@@ -203,14 +228,15 @@ def origin_of(link: str) -> str:
     pasted where the whole address goes — puts the key in the authority, and
     ``hostname`` lowercasing it does not make it safe: a 32-byte key can be spelled
     entirely in lowercase base64url, and a mangled key still gives away nearly all
-    of it. So a host that could be a key is not returned at all.
+    of it. So a host carrying key material is not returned at all — CARRYING, not
+    being, because "<key>.example" is a hostname and still hands over a key.
     """
     try:
         parts = urlsplit(link)
         host, port = parts.hostname, parts.port
     except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
         return ""
-    if not parts.scheme or not host or looks_like_a_key(host):
+    if not parts.scheme or not host or carries_key_material(host):
         return ""
     return f"{parts.scheme}://{host}{f':{port}' if port else ''}"
 
@@ -231,7 +257,29 @@ def redacted(link: str) -> str:
     return f"{origin}/<unrecognised>" if origin else "<unrecognised>"
 
 
-def _describe(value: str) -> str:
+def redacted_path(path: str) -> str:
+    """A filesystem path, with any component that could carry key material removed.
+
+    A PATH IS THE ONE VALUE THAT MUST USUALLY PRINT. "no such file" without the
+    name is useless, and it is the most common error this library raises — so this
+    works per COMPONENT rather than refusing the whole string. The directories a
+    caller typed are shown, and only a component that could carry a key is not.
+
+    THE THRESHOLD IS :data:`PATH_RUN`, NOT :data:`KEY_RUN`, and that is a correction
+    rather than a design. I used KEY_RUN here first, on the principle that one number
+    is better than two — and then this project's own test paths came out as
+    "/tmp/<17 characters>/pytest-63/<31 characters>/…", because "pytest-of-user" is
+    fourteen characters of base64url alphabet and so is half of everything anyone
+    names a directory. The two numbers answer genuinely different questions: for a
+    value, refusing costs nothing; for a path, refusing costs the name.
+    """
+    return "/".join(
+        f"<{len(part)} characters, not repeated>" if _PATH_CHARACTERS.search(part) else part
+        for part in path.split("/")
+    )
+
+
+def describe(value: str) -> str:
     """Name a value we did not recognise, WITHOUT repeating it.
 
     We are here because it is not an id, a name or a link, so we do not know what
@@ -253,20 +301,67 @@ def _describe(value: str) -> str:
 
 
 def quoted(value: str) -> str:
-    """``repr(value)`` — unless it might be a key, in which case it is not echoed.
+    """``repr(value)`` — unless it might CARRY key material, in which case it is not.
 
-    THE RULE, APPLIED WITHOUT EXCEPTION rather than site by site. Four reviews in
-    a row found a component of a link I had decided was safe to print: the
-    fragment, then the path, then the id under ``/s/``, then the HOST. Each
-    judgement was defensible on its own and each was wrong, and the last one
-    defeated an argument I had actually written down — that a hostname is never a
-    secret.
+    THE RULE, APPLIED WITHOUT EXCEPTION rather than site by site. Five reviews in a
+    row found a component of a link I had decided was safe to print: the fragment,
+    then the path, then the id under ``/s/``, then the HOST. Each judgement was
+    defensible on its own and each was wrong.
 
-    So there are no judgements left. Anything from the caller goes through here,
-    and anything key-shaped does not come out. Guessing which slots a key can
-    reach has now failed four times; refusing to echo one from any slot cannot.
+    AND "IS IT EXACTLY A KEY" WAS THE WRONG TEST, which was the next finding after
+    that. ``base_url_for(key[:-1])`` decodes to 31 bytes, so an exact test says "not
+    a key" and the message then printed 42 of the 43 characters. A key-shaped
+    hostname label with ``.example`` glued on passed the same way. What matters is
+    not whether the value IS a key but whether it CONTAINS enough of one, which is
+    the standard the tests were already holding messages to — so it is the standard
+    here, from one shared constant.
+
+    What still prints: a mistyped market code, a wrong scheme, a duration, a short
+    id — everything a person actually fat-fingers. What does not: any unbroken run
+    of :data:`KEY_RUN` base64url characters. A path keeps printing because ``/`` is
+    not in that alphabet and breaks every run.
     """
-    return "<a key, not repeated here>" if looks_like_a_key(value) else repr(value)
+    return "<not repeated here: it may carry a key>" if carries_key_material(value) else repr(value)
+
+
+#: How long a run of key characters has to be before a VALUE is not echoed. Twelve,
+#: which is conservative — and conservative HERE IS FREE, which is the whole reason
+#: for the number. Nothing anybody types into these slots (a market code, a scheme,
+#: a duration, an id) has an unbroken run that long, so refusing them costs a reader
+#: nothing. The tests import this rather than restating it, so what the library
+#: refuses and what the tests call a leak cannot drift apart.
+KEY_RUN = 12
+
+#: The same question for a PATH COMPONENT, where the answer has to be different and
+#: the reason is cost rather than danger. Refusing to print a filename is not free —
+#: "no such file" without the name is the commonest error this library raises — and
+#: real paths are full of long alphanumeric runs: "pytest-of-user" is fourteen
+#: characters, "test_the_absolute_path_esc0" is thirty-one.
+#:
+#: I SHIPPED KEY_RUN HERE FIRST and wrote a comment claiming two thresholds would be
+#: a mistake. Then the test suite's own tmp_path came back as
+#: "/tmp/<17 characters>/pytest-63/<31 characters>/…" and settled it.
+#:
+#: So this one is anchored in arithmetic instead of caution: a key is 43 base64url
+#: characters, so disclosing 32 leaves 11 — about 66 bits — which is where guessing
+#: the rest stops being hopeless. Below that a fragment is not usable on its own.
+PATH_RUN = 32
+
+#: The base64url alphabet, which is what a key is spelled in. Anything outside it —
+#: a dot, a slash, a colon, a space — breaks a run, which is why hostnames and most
+#: filenames keep printing in full.
+_KEY_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{KEY_RUN},}}")
+_PATH_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{PATH_RUN},}}")
+
+
+def carries_key_material(value: str) -> bool:
+    """Whether ``value`` contains an unbroken run long enough to be part of a key.
+
+    Deliberately blunter than :func:`looks_like_a_key`. That one answers "is this a
+    key", which is worth saying in a message; this one answers "could printing this
+    hand over part of one", which is the only question that matters before echoing.
+    """
+    return bool(_KEY_CHARACTERS.search(value))
 
 
 def looks_like_a_key(value: str) -> bool:

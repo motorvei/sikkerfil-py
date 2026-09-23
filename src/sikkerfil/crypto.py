@@ -83,7 +83,28 @@ def b64url_decode(text: str) -> bytes:
     """
     compact = "".join(text.split())
     padded = compact + "=" * (-len(compact) % 4)
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+    # THE STDLIB ERROR CARRIES THE VALUE. A UnicodeEncodeError holds the entire
+    # rejected string on `.object` — so a key with one smart quote in it, pasted
+    # into this by a caller following the README, produced an exception with the
+    # key inside it. Neither str() nor the message shows it, which is exactly why
+    # it survived several passes over these messages.
+    #
+    # Still a ValueError, because that is what a decoder raises and what callers
+    # catch (binascii.Error and UnicodeEncodeError are both ValueErrors). Raised
+    # after the handler has exited, so nothing is left on __context__ either.
+    decoded: bytes | None = None
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (TypeError, ValueError):
+        decoded = None
+    if decoded is None:
+        raise ValueError(
+            f"not base64url: {len(text)} characters that will not decode. The "
+            "value is not repeated here, because in this library it is usually a "
+            "decryption key."
+        )
+    return decoded
 
 
 def key_text(key: str | bytes | bytearray | memoryview) -> str:
@@ -115,23 +136,33 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
         # Whitespace and padding are b64url_decode's problem, for every caller
         # and not just this one — a key pasted into it directly had the same
         # modulo-four coin flip this function was fixed for.
+        decoded: bytes | None = None
         try:
-            raw = b64url_decode(key)
+            decoded = b64url_decode(key)
         # Both spellings of "not base64url" land here: binascii.Error for bad
         # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
         except (TypeError, ValueError):
-            # THE VALUE IS NOT IN THIS MESSAGE, deliberately. A key that fails
-            # to decode is usually a nearly correct key — one pasted character
-            # short, or with a smart quote in it — and repeating it here puts it
-            # in whatever log swallows the traceback. The whole premise is that
-            # the key never reaches a log.
+            decoded = None
+
+        # RAISED OUT HERE, NOT IN THE HANDLER, and that is the whole point of the
+        # flag. `raise ... from None` suppresses how a context is DISPLAYED; it
+        # does not remove the object, and a UnicodeEncodeError carries the entire
+        # rejected string on `.object` — so a near-miss key stayed reachable on
+        # __context__ with a clean message in front of it. Raising after the
+        # handler has exited means there is no context to carry.
+        if decoded is None:
+            # THE VALUE IS NOT IN THIS MESSAGE either, deliberately. A key that
+            # fails to decode is usually a nearly correct key — one character
+            # short, or with a smart quote in it — and repeating it here puts it in
+            # whatever log swallows the traceback.
             raise ConfigurationError(
                 "a sikkerfil key is base64url text or 32 raw bytes; this is "
                 f"{len(key)} characters that will not decode as base64url. The "
                 "value is not repeated here because it is a decryption key. The "
                 "text is what Sealed.key_text gives you, and what follows #k= in "
                 "a share link."
-            ) from None
+            )
+        raw = decoded
     if len(raw) != KEY_BYTES:
         raise ConfigurationError(
             f"a sikkerfil key is {KEY_BYTES} bytes ({KEY_BYTES * 8}-bit AES); this "

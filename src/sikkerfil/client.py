@@ -50,6 +50,7 @@ from .links import (
     ParsedLink,
     base_url_for,
     build_link,
+    describe,
     parse_link,
     redacted,
 )
@@ -454,27 +455,15 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
         path = Path(source).expanduser()
         if not path.is_file():
             # A KEY PASTED WHERE A FILENAME GOES is a sender-side mix-up like any
-            # other, and this echoed whatever it was given. Unlike a link, a path
-            # MUST usually be echoable — "no such file" without the name is
-            # useless — and the two needs settle themselves on the shape of the
-            # values: '/' is not in the base64url alphabet, so any path that keeps
-            # a directory through normalisation can never look like a key and is
-            # always named. Only a bare basename that is exactly key-shaped is
-            # withheld, and then the DIRECTORY is named instead, which is the
-            # diagnostic half of the message anyway.
+            # other. Unlike a link, a path MUST usually print — "no such file"
+            # without the name is useless, and it is the commonest error here — so
+            # redacted_path() works per component: the directories print, and only
+            # a component that could carry a key does not.
             #
-            # "Pass an absolute path" is the escape hatch, and it is what works:
-            # Path("./name") NORMALISES BACK to "name", so the obvious advice to
-            # add "./" would have been false. Tested, because the first version of
-            # this message gave exactly that advice.
-            if links.looks_like_a_key(str(path)):
-                raise ConfigurationError(
-                    f"no such file in {str(path.resolve().parent)!r}. The name is "
-                    "not repeated here: it is exactly the shape of a decryption "
-                    "key, and an error message ends up in a log. If that really is "
-                    "the filename, pass it as an absolute path and it will be named."
-                )
-            raise ConfigurationError(f"no such file: {path}")
+            # EXACTNESS WAS THE BUG HERE TOO. This used to ask "is it a key", so
+            # send(<key minus one character>) printed 42 of the 43. It asks whether
+            # the value CARRIES key material now, like every other slot.
+            raise ConfigurationError(f"no such file: {links.redacted_path(str(path))}")
         return path.read_bytes(), path.name
     if hasattr(source, "read"):
         data = source.read()
@@ -504,7 +493,12 @@ def _identify(share: str | SentShare, write_token: str | None) -> tuple[str, str
             "afterwards — an API key is not accepted here."
         )
     if not SHARE_ID.match(share):
-        raise ConfigurationError(f"{share!r} is not a share id")
+        # THIS BYPASSED THE CHOKEPOINT. Every raise in links.py goes through
+        # quoted() or _describe(); this one is in client.py and echoed the value
+        # directly, so revoke(<key>, write_token=...) — the same id/key column
+        # mix-up already handled for receive() — printed a working key. Being in a
+        # different file was the whole reason it was missed.
+        raise ConfigurationError(f"{describe(share)}. A share id is {SHARE_ID.pattern}")
     return share, write_token
 
 

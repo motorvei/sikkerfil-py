@@ -151,11 +151,19 @@ class ReceivedFile:
         return len(self.data)
 
     def __repr__(self) -> str:
-        """Without the plaintext. It is the file — the whole thing being protected."""
+        """Without the plaintext, AND WITHOUT THE FILENAME.
+
+        The file bytes are obviously the thing being protected. The name is less
+        obvious and is the reason ``encryptedName`` exists at all: the service
+        never learns it, because "oppsigelse-ansatt-4412.pdf" gives away the
+        document without a byte of it. Decrypting it locally and then printing it
+        into the application's logs hands back exactly what sealing it bought —
+        which makes masking the bytes and not the name no protection at all.
+        """
+        named = "a sealed name" if self.filename else "no name"
         return (
-            f"ReceivedFile(filename={self.filename!r}, "
-            f"content_type={self.content_type!r}, data=<{len(self.data)} bytes>, "
-            f"share={self.share.id!r})"
+            f"ReceivedFile({named}, content_type={self.content_type!r}, "
+            f"data=<{len(self.data)} bytes>, share={self.share.id!r})"
         )
 
     def save(self, directory: str = ".", *, filename: str | None = None) -> str:

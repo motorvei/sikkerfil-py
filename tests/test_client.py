@@ -378,41 +378,48 @@ def test_a_key_pasted_with_whitespace_still_opens_the_file(
     assert client.receive(sent.id, key=sent.key + trailing).data == PLAINTEXT
 
 
-def test_a_key_shaped_filename_is_not_echoed_but_the_directory_is(
-    client: Sikkerfil, tmp_path, monkeypatch
+def test_a_key_shaped_filename_is_not_echoed_but_the_path_around_it_is(
+    client: Sikkerfil, tmp_path
 ) -> None:
-    """A path must normally be echoable; a key must never be. They settle on shape.
+    """A path must normally print; a key must never. Settled per COMPONENT.
 
-    '/' is not in the base64url alphabet, so any path that keeps a directory
-    through normalisation cannot look like a key and is named in full. Only a bare
-    key-shaped basename is withheld — and then the directory is named instead,
-    which is the half of "no such file" that actually helps.
+    "no such file" without the name is the commonest error this library raises, so
+    refusing the whole string is not an option. Only a component that could carry
+    most of a key is replaced, and the directories the caller typed still print —
+    which is usually the half of the message that identifies the mistake anyway.
     """
-    monkeypatch.chdir(tmp_path)
     key_shaped = crypto.b64url_encode(bytes(range(32)))
 
     with pytest.raises(ConfigurationError) as caught:
-        client.send(key_shaped)
+        client.send(str(tmp_path / key_shaped))
     message = str(caught.value)
     assert key_shaped[:12] not in message, message
-    assert str(tmp_path) in message, "it did not say where it looked"
+    assert "43 characters" in message, "it did not say what it withheld"
+    # The directories are still there, or the message identifies nothing.
+    assert str(tmp_path) in message, message
 
 
-def test_the_absolute_path_escape_hatch_is_real(client: Sikkerfil, tmp_path) -> None:
-    """The first version of that message advised './name', which does not work.
+@pytest.mark.parametrize(
+    "path",
+    [
+        "rapport.pdf",
+        "data/2026/kvartalsrapport.pdf",
+        "/home/user/Documents/rapport.pdf",
+        "/tmp/pytest-of-user/pytest-63/test_send0/x",  # this suite's own tmp_path shape
+        "kvartalsrapport",  # no extension, fifteen characters
+    ],
+)
+def test_an_ordinary_missing_file_is_still_named_in_full(
+    client: Sikkerfil, path: str
+) -> None:
+    """The redaction must not swallow the normal case, which it did once.
 
-    Path("./name") normalises straight back to "name", so the advice would have
-    been false for the one person it was written for — someone whose file really is
-    named like a key. An absolute path survives normalisation, so it is named.
+    With the value threshold (twelve) applied to path components, "pytest-of-user"
+    and "test_the_absolute_path_esc0" were both replaced by their lengths — so this
+    suite's own temporary directories came back unreadable. A path component gets
+    the higher PATH_RUN threshold for exactly that reason, and these are the shapes
+    that proved it was needed.
     """
-    key_shaped = crypto.b64url_encode(bytes(range(32)))
-    absolute = tmp_path / key_shaped
-
     with pytest.raises(ConfigurationError) as caught:
-        client.send(str(absolute))
-    assert key_shaped in str(caught.value), "the escape hatch does not work"
-
-    # And the advice that was wrong stays wrong, so nobody reinstates it.
-    with pytest.raises(ConfigurationError) as caught:
-        client.send(f"./{key_shaped}")
-    assert key_shaped[:12] not in str(caught.value), "'./' does not escape normalisation"
+        client.send(path)
+    assert path in str(caught.value), str(caught.value)

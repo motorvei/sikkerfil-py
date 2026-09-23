@@ -67,6 +67,7 @@ from .errors import (
     ApiError,
     AuthenticationError,
     BudgetError,
+    ConfigurationError,
     NotFoundError,
     SignatureError,
     TransportError,
@@ -203,6 +204,25 @@ class Transport:
     ) -> tuple[bytes, dict[str, str]]:
         headers.setdefault("user-agent", self.user_agent)
         headers.setdefault("accept", "application/json")
+
+        # CHECKED HERE, BEFORE http.client ENCODES THEM. A header value that is not
+        # latin-1 raises UnicodeEncodeError from inside the standard library, and
+        # that exception carries the WHOLE VALUE on `.object` — so a credential with
+        # one smart quote in it, which is what a paste out of a document or a chat
+        # window produces, came back out inside a stdlib error. It was not even a
+        # SikkerfilError, so a caller catching ours never saw it coming.
+        #
+        # Every credential this library sends is ASCII by construction — wt_…,
+        # sikkerfil_sk_…, base64url — so a value that is not is a caller mistake,
+        # and it is refused by NAME rather than by value.
+        for name, value in headers.items():
+            if not value.isascii():
+                raise ConfigurationError(
+                    f"the {name} header is not ASCII, so it cannot be sent. Its "
+                    "value is not repeated here, because the headers this library "
+                    "sets carry credentials. A smart quote from a copied document "
+                    "is the usual cause."
+                )
 
         attempt = 0
         while True:

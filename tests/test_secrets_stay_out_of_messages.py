@@ -24,7 +24,7 @@ from collections.abc import Callable
 import pytest
 
 from sikkerfil import Sikkerfil, build_link, crypto, inspect, parse_link, receive
-from sikkerfil.errors import SikkerfilError
+from sikkerfil.errors import ConfigurationError, SikkerfilError
 from sikkerfil.links import base_url_for
 
 #: A real key, so a leak is unambiguous rather than a coincidental substring.
@@ -317,3 +317,97 @@ def test_a_lowercase_key_is_not_echoed_from_any_slot(shape: str) -> None:
     assert not any(
         LOWERCASE_KEY[i : i + RUN] in message for i in range(len(LOWERCASE_KEY) - RUN + 1)
     ), message
+
+
+# --- The three fixes that reverting proved had no test ------------------------
+#
+# Reverting each fix and counting failures is how these were found: four of seven
+# broke NOTHING when undone. The sweep caught two once it began reading what a
+# successful call returns; these three are shapes it does not construct.
+
+
+def test_a_parsed_link_does_not_print_its_key() -> None:
+    """The object `parse_link` HANDS BACK, from the module about not leaking keys.
+
+    Masking SentShare, Sealed and ReceivedFile and not this one was an oversight
+    rather than a distinction: `log.debug("parsed %s", parse_link(url))` is at
+    least as ordinary as logging a send result.
+    """
+    parsed = parse_link(f"https://sikkerfil.no/s/ABCD1234#k={SECRET}")
+    text = repr(parsed)
+    assert not _leaks(text), text
+    assert "ABCD1234" in text, "it stopped being useful"
+    assert "<hidden>" in text, "it does not say a key is there"
+
+    # A link with no key must not claim to have one.
+    assert "None" in repr(parse_link("https://sikkerfil.no/s/ABCD1234"))
+
+
+def test_an_accepted_link_does_not_carry_userinfo_into_its_origin() -> None:
+    """THE ONE THAT WAS NOT JUST A MESSAGE.
+
+    `ParsedLink.origin` was built from `netloc`, which keeps `user:password@` —
+    and `_client_for` installs that origin as `base_url`, so the credential would
+    have gone into every request URL and back out of any transport failure. The
+    redaction path stopped using netloc; the OPERATIONAL path had not.
+    """
+    parsed = parse_link(f"https://user:{SECRET}@sikkerfil.no/s/ABCD1234#k={SECRET}")
+    assert parsed.origin == "https://sikkerfil.no", parsed.origin
+    assert not _leaks(parsed.origin)
+    assert "user" not in parsed.origin
+
+    # A port is not a credential and must survive, or a stub or self-hosted origin
+    # silently stops working.
+    assert parse_link("http://127.0.0.1:5000/s/ABCD1234").origin == "http://127.0.0.1:5000"
+
+
+def test_a_decrypted_filename_does_not_reach_a_repr() -> None:
+    """The name is encrypted for the same reason the bytes are.
+
+    "oppsigelse-ansatt-4412.pdf" gives away the document without a byte of it,
+    which is precisely why the service never learns it. Decrypting it locally and
+    then printing it into the application's logs hands back what sealing it
+    bought, so masking the bytes and not the name is no protection at all.
+    """
+    from sikkerfil.models import ReceivedFile, Share
+
+    share = Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    got = ReceivedFile(
+        data=b"Omsetning: 4 200 000 NOK",
+        filename="oppsigelse-ansatt-4412.pdf",
+        content_type="application/pdf",
+        share=share,
+    )
+    text = repr(got)
+    assert "oppsigelse" not in text, text
+    assert "Omsetning" not in text, text
+    assert "24 bytes" in text and "ABCD1234" in text, "it stopped being useful"
+
+
+def test_a_refused_key_leaves_no_exception_to_walk() -> None:
+    """Belt and braces, and the braces are what is asserted here.
+
+    The VALUE no longer reaches these messages because b64url_decode stopped
+    putting it in one. This asserts the other half: nothing is raised while an
+    exception is being handled, so there is no `__context__` for a tracker to walk
+    at all. Reverting the restructure alone breaks no test today — the value is
+    masked either way — so without this the second layer could be removed and
+    nobody would know until it mattered.
+    """
+    for bad in (SECRET[:-1] + "ø", SECRET[:-1] + chr(0x2019), "abc"):
+        with pytest.raises(ConfigurationError) as caught:
+            crypto.key_text(bad)
+        assert caught.value.__context__ is None, repr(caught.value.__context__)
+        assert caught.value.__cause__ is None
+
+    with pytest.raises(ConfigurationError) as caught:
+        parse_link(f"https://[oops/x#k={SECRET}")
+    assert caught.value.__context__ is None, repr(caught.value.__context__)
