@@ -647,11 +647,43 @@ def test_a_key_in_any_content_type_token_is_refused(client: Sikkerfil, stub) -> 
         f"text/plain; {key}=x",
         f'text/plain; k="{escaped}"',
         f'text/plain; k="{bytes(range(32)).hex(".")}"',
-        f"text/plain; charset={base64.a85encode(b' ' * 32, foldspaces=True).decode()}",
+        f'text/plain; k="{base64.b32encode(bytes(range(32))).decode()}"',
+        # A SEMICOLON INSIDE A QUOTED VALUE IS DATA. Splitting on every semicolon made
+        # the tail a parameter NAME, so the quoted-pair unescaping — which only runs
+        # on values — never saw it, and a compliant consumer unescapes it to the key.
+        'text/plain; note="safe;' + "\\" + "\\".join(bytes(range(32)).hex()) + '"',
+        # AND A RENDERING WITH ORDINARY TEXT AROUND IT. The whole token is not a
+        # rendering; sixty-four of its characters are.
+        f'text/plain; k="prefix{bytes(range(32)).hex()}suffix"',
+        f'text/plain; k="see {base64.b32encode(bytes(range(32))).decode()} ok"',
     ):
         with pytest.raises(ConfigurationError):
             client.send(PLAINTEXT, content_type=refused)
     assert len(stub.requests) == before, "a request went out before the refusal"
+
+    # THE TRADE, ASSERTED SO THAT IT STAYS A DECISION. A key rendered in base85 is
+    # NOT refused here any more, and this test asserted that it was until the round
+    # that found the cost: base85 is forty characters of an alphabet covering nearly
+    # everything printable, and z85 — present from 3.13 — decodes both forty and
+    # forty-one. That test refused application/tamp-community-update-confirm, a type
+    # mimetypes hands out and _guess_type sends when content_type is left out.
+    #
+    # A media type is a registered token whose length nobody chose, so a length test
+    # has nothing to say about it. Somebody who renders their key in base85 and pastes
+    # it into content_type is not making a mistake this library can tell apart from a
+    # media type. In the PASSWORD slot, where the cost is one caller's password rather
+    # than a value the library itself sends, the length tests still apply.
+    import mimetypes
+
+    registered = mimetypes.guess_type("x.cuc")[0]
+    assert registered == "application/tamp-community-update-confirm"
+    client.send(PLAINTEXT, content_type=registered)
+    assert json.loads(stub.requests[-3].body)["contentType"] == registered
+
+    # And in the PASSWORD slot, where the cost is one caller's password rather than a
+    # value the library itself sends, the length tests still apply.
+    with pytest.raises(ConfigurationError):
+        client.send(PLAINTEXT, password=base64.a85encode(b" " * 32, foldspaces=True).decode())
 
     # And the Content-Type values a real caller sends, including a boundary of the
     # length people actually generate.

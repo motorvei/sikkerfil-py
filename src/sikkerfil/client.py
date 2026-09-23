@@ -580,14 +580,49 @@ def _is_a_content_type(value: str) -> bool:
     deleting the slash, so the slash-joined form is asked about as well — the same
     reading the path predicate gives a chunked key.
     """
-    if not _MEDIA_TYPE.fullmatch(value) or links.renders_key_bytes(value):
+    if not _MEDIA_TYPE.fullmatch(value):
+        return False
+    # THE SLASH-DELETED JOIN ASKS THE BASE64 QUESTION ONLY, and that is a correction
+    # of my own over-reach. The join is an artefact — nobody sends it — and it exists
+    # to catch one thing: a base64 key with a separator pushed into it, as in
+    # "<20 characters>/<23 more>". Asking the WIDE question of it refused
+    # application/tamp-community-update-confirm, a registered type whose forty joined
+    # characters happen to decode as base85, while leaving content_type out sent the
+    # identical value. Every degenerate rendering is a length test; an artificial
+    # string is exactly where a length test should not be asked.
+    if links.spells_a_key_exactly(value.replace("/", "")):
         return False
     # EVERY TOKEN, not the whole string and one join. "text/<a key>" and
     # "text/plain; <a key>=x" are both valid media types whose surrounding text makes
     # the WHOLE value too long to decode as anything — and my previous version looked
     # at the complete value, the slash-deleted value, and the text after each "=",
     # which is three places out of five. A key does not care which token it is in.
-    return not any(links.renders_key_bytes(token) for token in _content_type_tokens(value))
+    return not any(_a_key_hides_in(token) for token in _content_type_tokens(value))
+
+
+def _a_key_hides_in(token: str) -> bool:
+    """Whether one part of a Content-Type carries a key, WITHOUT the length tests.
+
+    THE DEGENERATE RENDERINGS DO NOT BELONG HERE and this is the second registered
+    media type they cost me. base85 of 32 bytes is forty characters of an alphabet
+    covering nearly everything printable, and z85 — which exists from 3.13, one of the
+    versions this package supports — decodes BOTH forty and forty-one characters. So
+    "does this decode to 32 bytes" refused application/tamp-community-update-confirm,
+    41 characters, a type mimetypes hands out and _guess_type sends by itself.
+
+    A media type is a registered token of a length nobody chose, so the length tests
+    have nothing to say about it. What is asked instead: is it exactly a key in the
+    base64 family — the spelling our own links and our own documentation use, and so
+    the one a caller could paste here by mistake — or does it hold one of the strict
+    renderings, whose alphabets mean something. A caller who renders their key in
+    base85 and pastes it into content_type is not making a mistake this library can
+    tell apart from a media type, and pretending otherwise costs values people send.
+    """
+    return (
+        links.spells_a_key_exactly(token)
+        or links.renders_key_bytes_strictly(token)
+        or links.renders_key_bytes_strictly_inside(token)
+    )
 
 
 def _content_type_tokens(value: str) -> list[str]:
@@ -598,10 +633,10 @@ def _content_type_tokens(value: str) -> list[str]:
     backslashes out and the grammar lets them in: ``k="<key with a backslash before
     every tenth character>"`` passed every check while unescaping to the key.
     """
-    head, _, parameters = value.partition(";")
+    head, *parameters = _split_on_unquoted_semicolons(value)
     kind, _, subtype = head.strip().partition("/")
-    tokens = [head.strip(), head.replace("/", "").strip(), kind, subtype]
-    for parameter in parameters.split(";"):
+    tokens = [head.strip(), kind, subtype]
+    for parameter in parameters:
         name, _, given = parameter.partition("=")
         tokens.append(name.strip())
         given = given.strip()
@@ -609,6 +644,34 @@ def _content_type_tokens(value: str) -> list[str]:
             given = _QUOTED_PAIR.sub(r"\1", given[1:-1])
         tokens.append(given)
     return [token for token in tokens if token]
+
+
+def _split_on_unquoted_semicolons(value: str) -> list[str]:
+    """Split a Content-Type on its parameter separators, respecting quotes.
+
+    A SEMICOLON INSIDE A QUOTED VALUE IS DATA. Splitting on every semicolon made
+    ``note="safe;<an escaped key>"`` into two parameters, the second of which was read
+    as a NAME — so the quoted-pair unescaping, which only runs on values, never saw
+    it, and a standards-compliant consumer unescapes the whole thing back to the key.
+    Fixing the escapes without fixing the tokeniser fixed half of one mistake.
+    """
+    pieces: list[list[str]] = [[]]
+    quoted = escaped = False
+    for character in value:
+        if escaped:
+            pieces[-1].append(character)
+            escaped = False
+        elif character == "\\" and quoted:
+            pieces[-1].append(character)
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+            pieces[-1].append(character)
+        elif character == ";" and not quoted:
+            pieces.append([])
+        else:
+            pieces[-1].append(character)
+    return ["".join(piece) for piece in pieces]
 
 
 def _nothing_here_is_a_key(

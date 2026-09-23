@@ -1492,3 +1492,87 @@ def test_a_rendering_that_only_exists_once_the_path_is_joined_is_refused(tmp_pat
         "/home/me/Downloads/kvartalsrapport-2026-q3.pdf",
     ):
         assert not joined_path_spells_a_key(ordinary), ordinary
+
+
+# --- Round twenty-one: which renderings may be asked where ----------------------
+
+
+def test_base32_and_every_hex_separator_are_renderings_too() -> None:
+    """Two more encoders, and a separator that is itself a hex digit.
+
+    ``hex("a")`` was the third attempt at that one: I named ":" and "-", then took
+    "whatever character is not a hex digit" — which hex("a") walks past — and then
+    deleting every "a" also deletes the "a" inside "0a". What bytes.hex produces is
+    fixed-size groups with one character between them, so the SHAPE is what is
+    checked, at every group size.
+    """
+    import base64
+
+    from sikkerfil.links import renders_key_bytes, renders_key_bytes_strictly
+
+    raw = bytes(range(32))
+    for separator in ".:-_|+ abcdefABCDEF0123456789xyz/\\":
+        for per_group in (1, 2, 4, 8, 16):
+            spelling = raw.hex(separator, per_group)
+            assert renders_key_bytes(spelling), spelling[:40]
+            assert renders_key_bytes_strictly(spelling), spelling[:40]
+    for spelling in (base64.b32encode(raw).decode(), base64.b32hexencode(raw).decode()):
+        assert renders_key_bytes(spelling)
+        assert renders_key_bytes_strictly(spelling)
+
+
+def test_the_strict_renderings_may_be_asked_of_joins_and_the_others_may_not() -> None:
+    """THE DIVISION THIS ROUND IS ABOUT, asserted from both sides.
+
+    Some renderings carry information in every character — hex is 64 characters of
+    sixteen, base32 is 56 of thirty-two — and some are a length test in costume:
+    base64 is any 43 alphanumerics, base85 any 40 printable characters, and z85
+    (3.13) decodes both 40 AND 41. The second group may only be asked about a whole
+    value a caller handed over; the first may be asked about joins, subsequences and
+    windows, because a hostname does not accidentally contain 64 hex digits.
+    """
+    import base64
+
+    from sikkerfil.links import origin_of, path_carries_key_material, renders_key_bytes_strictly
+
+    raw = bytes(range(32))
+    # A domain whose labels join to 43 characters of base64url — the degenerate test
+    # would call this a key, and it is an ordinary name.
+    assert not renders_key_bytes_strictly("privatesecurefilescompanyinternalexamplecom")
+    assert origin_of("https://private.secure.files.company.internal.example.com/x") != ""
+
+    # The strict renderings, split by the structure rather than by a caller.
+    assert origin_of("https://" + raw.hex(".") + "/x") == ""
+    assert path_carries_key_material("/tmp/" + raw.hex("/"))
+    assert path_carries_key_material(raw.hex("/"))
+    for spelling in (base64.b64encode(raw).decode(), base64.b85encode(raw).decode()):
+        assert not renders_key_bytes_strictly(spelling), spelling
+
+
+def test_our_own_refusals_do_not_print_a_rendering() -> None:
+    """quoted() is the chokepoint, so it asks the whole question.
+
+    ``base_url_for(key.hex("."))`` put ninety-five characters of dotted hex into its
+    own refusal: every run in it is two characters long, so the run test — which is
+    all quoted() asked — saw nothing.
+    """
+    import base64
+
+    from sikkerfil.links import base_url_for, quoted
+
+    raw = bytes(range(32))
+    for spelling in (
+        raw.hex("."),
+        raw.hex(),
+        base64.b32encode(raw).decode(),
+        base64.b64encode(raw).decode(),
+        base64.b85encode(raw).decode(),
+    ):
+        assert "not repeated" in quoted(spelling), spelling[:40]
+        with pytest.raises(ConfigurationError) as caught:
+            base_url_for(spelling)
+        assert spelling[:20] not in str(caught.value)
+
+    # And what a person actually mistypes still prints, or the message is useless.
+    for ordinary in ("nope", "NO", "sv", "x", "no/"):
+        assert repr(ordinary) == quoted(ordinary), ordinary

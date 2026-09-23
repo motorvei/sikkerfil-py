@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -389,22 +390,13 @@ def renders_key_bytes(value: str) -> bool:
     if len(spelled) == KEY_TEXT_LENGTH and looks_like_a_key(spelled):
         return True
 
-    # Hex, with whatever bytes.hex(sep=...) was given. Naming ":" and "-" was
-    # enumerating again — hex(".") and hex("_") and hex("|") are the same rendering —
-    # so the separator is whatever single character is in the way, which is what
-    # hex(sep) produces by construction. One character: a value with two kinds of
-    # punctuation in it is not a hex dump.
-    hexish = compact.removeprefix("0x")
-    strange = {character for character in hexish if character not in _HEX_DIGITS}
-    if len(strange) == 1:
-        hexish = hexish.replace(strange.pop(), "")
-    if len(hexish) == KEY_BYTES * 2:
-        try:
-            bytes.fromhex(hexish)
-        except ValueError:
-            pass
-        else:
-            return True
+    if _is_hex_of_a_key(compact):
+        return True
+
+    # Base32, both alphabets. b32encode gives 56 characters and b32hexencode 64, and
+    # neither is reachable by any of the tests above.
+    if _is_base32_of_a_key(compact):
+        return True
 
     if _is_a_bytes_literal_of_a_key(value):
         return True
@@ -461,7 +453,87 @@ def renders_key_bytes(value: str) -> bool:
     return False
 
 
-def _spells_a_key_exactly(text: str) -> bool:
+def _is_hex_of_a_key(compact: str) -> bool:
+    """Whether ``compact`` is 32 bytes in hex, with or without a separator.
+
+    THE SEPARATOR IS A POSITION, NOT A CHARACTER, and that took three goes to see. I
+    named ":" and "-"; then I took "whatever character is not a hex digit", which
+    hex("a") walks past because its separator is inside the alphabet; and then
+    deleting every "a" from hex("a") ALSO deletes the "a" inside "0a", so the digits
+    come out wrong. What bytes.hex(sep, bytes_per_sep) actually produces is fixed-size
+    groups of hex digits with one character between them, so that is what is checked:
+    the shape, at every group size, with the separators required to agree.
+    """
+    candidate = compact.removeprefix("0x")
+    if len(candidate) == KEY_BYTES * 2 and _is_hex(candidate):
+        return True
+    for per_group in range(1, KEY_BYTES):
+        groups = -(-KEY_BYTES // per_group)
+        if groups < 2:
+            break
+        if len(candidate) != KEY_BYTES * 2 + groups - 1:
+            continue
+        separators: set[str] = set()
+        digits: list[str] = []
+        at = 0
+        for group in range(groups):
+            size = 2 * min(per_group, KEY_BYTES - group * per_group)
+            digits.append(candidate[at : at + size])
+            at += size
+            if group < groups - 1:
+                separators.add(candidate[at])
+                at += 1
+        if len(separators) == 1 and all(_is_hex(piece) for piece in digits):
+            return True
+    return False
+
+
+def _is_base32_of_a_key(compact: str) -> bool:
+    """32 bytes in either base32 alphabet — 56 characters, or 64 in base32hex."""
+    for decode in (base64.b32decode, base64.b32hexdecode):
+        try:
+            if len(decode(compact.upper())) == KEY_BYTES:
+                return True
+        except (ValueError, TypeError, binascii.Error):
+            continue
+    return False
+
+
+def _is_hex(text: str) -> bool:
+    """Whether every character is a hex digit, and there is an even number of them."""
+    if not text or len(text) % 2:
+        return False
+    try:
+        bytes.fromhex(text)
+    except ValueError:
+        return False
+    return True
+
+
+def renders_key_bytes_strictly(value: str) -> bool:
+    """The renderings whose ALPHABET says something, not just their length.
+
+    THE DIVISION THIS DRAWS IS THE POINT OF THIS ROUND. Some renderings of 32 bytes
+    carry information in every character and some are a length test wearing a
+    costume:
+
+    * hex is 64 characters of sixteen; base32 is 56 of thirty-two, uppercase, without
+      0, 1, 8 or 9. Ordinary text does not accidentally look like either.
+    * base64 is 43 characters of sixty-four and base85 is 40 of eighty-five — which
+      is to say ANY forty-three alphanumerics and ANY forty printable characters.
+      "privatesecurefilescompanyinternalexamplecom" is forty-three characters of
+      base64url, and that is a domain.
+
+    So the second group may only ever be asked about a WHOLE value a caller handed
+    over, where a refusal is explainable. The first group can be asked about joins and
+    subsequences too, because a 64-character run of hex digits inside a hostname is
+    not a hostname.
+    """
+    compact = "".join(value.split())
+    return _is_hex_of_a_key(compact) or _is_base32_of_a_key(compact)
+
+
+def spells_a_key_exactly(text: str) -> bool:
     """Whether ``text`` is a key in the base64 family, and nothing longer or shorter.
 
     The narrow question, for asking about a JOIN. renders_key_bytes answers the wide
@@ -670,6 +742,49 @@ def _parts_carrying_key(parts: Sequence[str], *, chunk_floor: int = 4) -> set[in
     # whoever cut it, while /home/me/Documents/work/2026/rapporter is not. Measured
     # over 99,595 real paths on this machine, this redacts 0.06% of them.
     suspect |= _uniform_run_carrying_key(parts, chunk_floor)
+    # AND THE STRICT RENDERINGS, at every contiguous run and at any floor. A prefix
+    # defeated everything above: "/tmp/" + hex("/") is two-character components, none
+    # of them a fragment by any threshold, joining to a key in hex.
+    suspect |= _subsequence_renders_key_strictly(parts)
+    return suspect
+
+
+def renders_key_bytes_strictly_inside(value: str) -> bool:
+    """Whether a hex or base32 rendering is IN ``value``, decorated or not.
+
+    A WINDOW SCAN, WHICH ONLY THE STRICT RENDERINGS EARN. "safe;" in front of sixty-
+    four hex digits is not a rendering as a whole and contains one — and the same
+    scan over the degenerate spellings would refuse any value with forty printable
+    characters in it, which is a password.
+
+    The lengths are derived from what the encoders produce rather than guessed: 56 for
+    base32, 64 for hex and base32hex, and hex with a separator at every group size.
+    """
+    compact = "".join(value.split())
+    for length in _STRICT_LENGTHS:
+        for start in range(len(compact) - length + 1):
+            if renders_key_bytes_strictly(compact[start : start + length]):
+                return True
+    return False
+
+
+def _subsequence_renders_key_strictly(parts: Sequence[str]) -> set[int]:
+    """Which contiguous components join into a hex or base32 rendering of a key.
+
+    ASKED OF EVERY CONTIGUOUS RUN, unlike the base64 partition test, and that is
+    affordable for exactly one reason: these two renderings say something with every
+    character. bytes(range(32)).hex(".") is thirty-two two-character labels that join
+    to sixty-four hex digits, and a hostname or a path prefix in front of it does not
+    change what it is — while an ordinary domain joining to sixty-four hex digits is
+    not a thing that happens. The base64 family cannot be asked this way at all:
+    "privatesecurefilescompanyinternalexamplecom" is forty-three characters of
+    base64url, and it is a domain.
+    """
+    suspect: set[int] = set()
+    for start in range(len(parts)):
+        for end in range(start + 2, len(parts) + 1):
+            if renders_key_bytes_strictly("".join(parts[start:end])):
+                suspect.update(range(start, end))
     return suspect
 
 
@@ -711,7 +826,7 @@ def _uniform_run_carrying_key(parts: Sequence[str], chunk_floor: int = 4) -> set
         # about one whole value and is not tolerable here, where every pair of
         # neighbouring components is a candidate. This suite's own tmp_path said so:
         # "test_a_tilde_in_the_directory_0" and "Downloads" are 31 and 9.
-        if len(widest) >= 2 and _spells_a_key_exactly("".join(parts[index] for index in widest)):
+        if len(widest) >= 2 and spells_a_key_exactly("".join(parts[index] for index in widest)):
             suspect.update(widest)
 
     for index, part in enumerate(parts):
@@ -820,6 +935,18 @@ def describe(value: str) -> str:
     return f"a {len(value)}-character value that is not repeated here, in case it is a key"
 
 
+def _safe_to_echo(value: str) -> bool:
+    """Whether printing ``value`` hands over nothing.
+
+    BOTH QUESTIONS, because carries_key_material reads runs and a rendering need not
+    contain one: base_url_for(key.hex(".")) put ninety-five characters of dotted hex
+    into its own refusal, every run of it two characters long. quoted() is the
+    chokepoint every message in this module goes through, so it is the place where
+    "could this be a key in some spelling" has to be asked in full.
+    """
+    return not carries_key_material(value) and not renders_key_bytes(value)
+
+
 def quoted(value: str) -> str:
     """``repr(value)`` — unless it might CARRY key material, in which case it is not.
 
@@ -836,12 +963,17 @@ def quoted(value: str) -> str:
     the standard the tests were already holding messages to — so it is the standard
     here, from one shared constant.
 
+    AND A RUN IS NOT THE ONLY SHAPE, which was the finding after THAT.
+    ``base_url_for(key.hex("."))`` put ninety-five characters of dotted hex into its
+    own refusal, and every run in it is two characters long. So this asks both
+    questions — runs, and whether the whole value is a rendering of 32 bytes in any
+    spelling the standard library writes.
+
     What still prints: a mistyped market code, a wrong scheme, a duration, a short
-    id — everything a person actually fat-fingers. What does not: any unbroken run
-    of :data:`KEY_RUN` base64url characters. A path keeps printing because ``/`` is
-    not in that alphabet and breaks every run.
+    id — everything a person actually fat-fingers. What does not: an unbroken run of
+    :data:`KEY_RUN` base64url characters, or a value that decodes to 32 bytes.
     """
-    return "<not repeated here: it may carry a key>" if carries_key_material(value) else repr(value)
+    return "<not repeated here: it may carry a key>" if not _safe_to_echo(value) else repr(value)
 
 
 #: How long a run of key characters has to be before a VALUE is not echoed. Twelve,
@@ -878,6 +1010,13 @@ KEY_TEXT_LENGTH = -(-KEY_BYTES * 4 // 3)
 #: The characters a hex dump is made of, so that everything else in one is its
 #: separator.
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+#: How long the STRICT renderings of 32 bytes are: base32 (56), hex and base32hex
+#: (64), and hex with one separator character at every group size it takes. Derived,
+#: because a list of lengths I typed is the same mistake as a list of alphabets.
+_STRICT_LENGTHS = sorted(
+    {56, 64} | {64 + -(-KEY_BYTES // per_group) - 1 for per_group in range(1, KEY_BYTES)}
+)
 
 #: A component that is nothing but key alphabet — no dot, no space, no extension.
 _EVENLY_CHUNKED = re.compile(r"[A-Za-z0-9_-]+")
