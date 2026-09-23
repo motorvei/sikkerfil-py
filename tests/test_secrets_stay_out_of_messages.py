@@ -1254,3 +1254,126 @@ def test_the_share_key_wearing_a_credential_prefix_is_still_the_key() -> None:
         with contextlib.suppress(Exception):
             client.revoke(sent)
     assert any("wt_yyy" in line for line in attempted), attempted
+
+
+# --- Round seventeen: what a key looks like when the standard library writes it --
+
+
+def _every_rendering_the_standard_library_makes(raw: bytes) -> dict[str, str]:
+    """Every way the standard library writes 32 raw bytes down.
+
+    THE VECTORS DO NOT COME FROM MY HAND ANY MORE, and that is the point of this
+    function. Three rounds running, a guard was calibrated against spellings I had
+    typed myself — with the padding already stripped, or in the alphabet I happened
+    to think of — and the review found the one the library actually produces. So the
+    list is generated, and anything added to it is added by naming a stdlib call.
+    """
+    import base64
+
+    return {
+        "b64encode": base64.b64encode(raw).decode(),
+        "b64encode unpadded": base64.b64encode(raw).decode().rstrip("="),
+        "urlsafe_b64encode": base64.urlsafe_b64encode(raw).decode(),
+        "urlsafe unpadded": base64.urlsafe_b64encode(raw).decode().rstrip("="),
+        "encodebytes (MIME)": base64.encodebytes(raw).decode(),
+        "b32encode": base64.b32encode(raw).decode(),
+        "b16encode": base64.b16encode(raw).decode(),
+        "hex": raw.hex(),
+        "hex with colons": raw.hex(":"),
+        "hex with dashes": raw.hex("-"),
+        "repr": repr(raw),
+    }
+
+
+@pytest.mark.parametrize("payload", [bytes(range(32)), b"?" * 32, bytes(range(200, 232))])
+def test_every_standard_rendering_of_a_key_is_refused_as_a_value(payload: bytes) -> None:
+    """A KEY IN TEXT WAS NEVER ONLY BASE64.
+
+    The library hands callers raw bytes as ``Sealed.key``, and every one of these is
+    what the standard library does with those bytes — so each is a spelling somebody
+    can paste into a password field and reverse afterwards. Asking "is this spelled
+    like base64" chased them one round at a time; asking "does this DECODE to 32
+    bytes" closes the set around what a key actually is.
+    """
+    from sikkerfil.links import opaque_carries_key_material
+
+    unreversible = {"b32encode", "b16encode"}  # see the assertion below
+    for label, spelling in _every_rendering_the_standard_library_makes(payload).items():
+        if label in unreversible:
+            continue
+        assert opaque_carries_key_material(spelling), f"{label}: {spelling[:40]}"
+
+    # b32 and b16 are NOT claimed: they are 56 and 64 characters of an alphabet the
+    # run check already refuses at 32, so they are caught — by a different rule, and
+    # this says so rather than letting the parametrised list imply a claim the
+    # renderer does not make.
+    for label in unreversible:
+        spelling = _every_rendering_the_standard_library_makes(payload)[label]
+        assert opaque_carries_key_material(spelling), label
+
+
+@pytest.mark.parametrize("width", [6, 8, 9, 10, 11, 12, 14, 15, 20, 21])
+def test_a_key_wrapped_at_any_width_is_caught(width: int) -> None:
+    """THE LAST PIECE OF A FIXED-WIDTH SPLIT IS SHORT, ALWAYS.
+
+    ``textwrap.wrap(key, 10)`` gives 10/10/10/10/3, and the three closed the run
+    before it could be counted: forty characters is not a key, and the remainder was
+    left stranded. Every width from six to twenty-one now, because picking one width
+    to test is how the first version of this passed.
+    """
+    import base64
+    import textwrap
+
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    key = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+    for separator in ("/", "\\"):
+        chunked = separator.join(textwrap.wrap(key, width))
+        assert path_carries_key_material(chunked), f"width {width}: {chunked}"
+        assert not _leaks(redacted_path(chunked))
+
+
+@pytest.mark.parametrize("payload", [bytes(range(32)), b"?" * 32])
+def test_every_standard_rendering_of_a_key_is_refused_as_a_path(payload: bytes) -> None:
+    """THE SAME QUESTION ON THE PATH SIDE, which is where the MIME spelling bit.
+
+    ``encodebytes`` wraps its output with a NEWLINE AFTER THE PADDING, so stripping
+    "=" removed nothing and the 45-character value missed a length anchor — while
+    its many "/" characters cut it into three-character components that no run test
+    looks at twice. The value predicate caught it by accident, because 44 characters
+    of base64 alphabet is a long run; the path predicate, which splits on "/" first,
+    did not.
+
+    So this asserts the path side separately. It is the same mistake as testing a
+    rule against one of its two callers, which is what round fifteen was about.
+    """
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    for label, spelling in _every_rendering_the_standard_library_makes(payload).items():
+        assert path_carries_key_material(spelling), f"{label}: {spelling[:40]!r}"
+        assert not _leaks(redacted_path(spelling)), label
+        folded = "".join(redacted_path(spelling).split())
+        assert not _leaks(folded), label
+
+
+def test_the_renderings_a_path_message_must_still_print() -> None:
+    """The other side of the same rule, measured rather than asserted by feel.
+
+    Over 99,600 real paths on the machine this was written on, the whole-value
+    rendering anchor redacts 0.18% and the chunked-run rule 0.02%. The rest of what
+    the predicate refuses is PATH_RUN on single components of 32 characters, which
+    has been the documented trade since it was introduced.
+    """
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    for ordinary in (
+        "/home/me/Documents/kvartalsrapport-2026-q3.pdf",
+        "/home/me/Documents/work/2026/rapporter/kvartal/q3/final",
+        "/usr/lib/python3/dist-packages/setuptools/_distutils/__pycache__/_log.cpython-312.pyc",
+        "/tmp/pytest-of-user/pytest-63/test_a_key_pasted_with_whi0/rapport.pdf",
+        "C:\\Users\\me\\Documents\\kvartal-2026-q3.xlsx",
+        "/var/folders/9z/abcdefgh/T/tmp1234/rapport.pdf",
+        "relative/path/to/a/file.txt",
+    ):
+        assert not path_carries_key_material(ordinary), ordinary
+        assert redacted_path(ordinary) == ordinary

@@ -17,6 +17,7 @@ guarantee the key never reaches a request.
 
 from __future__ import annotations
 
+import ast
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -355,6 +356,63 @@ def path_carries_key_material(path: str) -> bool:
     return _is_a_key_spelled_with_slashes(path) or structured_carries_key(_components(path))
 
 
+def renders_key_bytes(value: str) -> bool:
+    """Whether ``value`` is a rendering of 32 raw bytes that anybody could reverse.
+
+    THE PREVIOUS VERSION OF THIS ASKED ONLY ABOUT BASE64, and the review that
+    followed handed me three spellings it could not see: MIME base64, which
+    ``encodebytes`` wraps with a newline AFTER the padding; ``repr(raw_key)``; and
+    ``raw_key.hex(":")``. Every one of them is produced by the standard library from
+    the raw bytes this library itself hands callers as ``Sealed.key`` — so "a key in
+    text" was never only base64, and each round of chasing another alphabet was
+    treating a symptom.
+
+    So the question is asked the other way round: not "is this spelled like a key"
+    but "does this DECODE to 32 bytes under a rendering somebody could undo". That
+    set is enumerable, because it is the set the standard library produces:
+
+    * base64, either alphabet, padded or not, with any whitespace in it;
+    * hex, with or without the ``:`` and ``-`` people put between the pairs;
+    * a bytes literal, as ``repr()`` writes one.
+
+    It is still a closed set and it can still be wrong, but it is closed around
+    something real — what a 32-byte key looks like when it is written down — rather
+    than around the spellings I happened to think of.
+    """
+    compact = "".join(value.split())
+    if not compact:
+        return False
+
+    spelled = _aliased(compact).rstrip("=")
+    if len(spelled) == KEY_TEXT_LENGTH and looks_like_a_key(spelled):
+        return True
+
+    # Hex, as hex(), hex(":") and hex("-") write it. Not "0x"-prefixed: that is a
+    # different rendering and it is one character from this one.
+    hexish = compact.replace(":", "").replace("-", "").removeprefix("0x")
+    if len(hexish) == KEY_BYTES * 2:
+        try:
+            bytes.fromhex(hexish)
+        except ValueError:
+            pass
+        else:
+            return True
+
+    return _is_a_bytes_literal_of_a_key(value)
+
+
+def _is_a_bytes_literal_of_a_key(value: str) -> bool:
+    """``repr(key)`` — what an f-string does to raw bytes, and what a log line keeps."""
+    text = value.strip()
+    if not text.startswith(("b'", 'b"')) or len(text) > 4 * KEY_BYTES * 8:
+        return False
+    try:
+        decoded = ast.literal_eval(text)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return isinstance(decoded, bytes) and len(decoded) == KEY_BYTES
+
+
 def _is_a_key_spelled_with_slashes(value: str) -> bool:
     """Whether ``value`` IS a key, with standard base64's ``/`` and ``+`` in it.
 
@@ -376,12 +434,12 @@ def _is_a_key_spelled_with_slashes(value: str) -> bool:
     separator as a key character somewhere, and every version of that I could measure
     costs more paths than it is worth.
     """
-    # PADDING FIRST, because canonical standard base64 of 32 bytes is FORTY-FOUR
-    # characters: b64encode ends it with "=". I measured the anchor against a
-    # spelling I had written myself with .rstrip("="), so the one the standard
-    # library actually produces was a character too long and walked past the check.
-    compact = value.rstrip("=")
-    return len(compact) == KEY_TEXT_LENGTH and looks_like_a_key(_aliased(compact))
+    # PADDING AND WHITESPACE FIRST. Canonical standard base64 of 32 bytes is
+    # FORTY-FOUR characters — b64encode pads — and encodebytes adds a newline after
+    # the padding, so rstrip("=") alone removed nothing from the MIME spelling. Both
+    # come off in renders_key_bytes, which also knows the renderings that are not
+    # base64 at all.
+    return renders_key_bytes(value)
 
 
 def redacted_path(path: str) -> str:
@@ -531,15 +589,27 @@ def _uniform_run_carrying_key(parts: Sequence[str]) -> set[int]:
     suspect: set[int] = set()
     run: list[int] = []
 
-    def close() -> None:
-        if len(run) >= 2 and _holds_a_key("".join(parts[index] for index in run)):
-            suspect.update(run)
+    def close(remainder: int | None = None) -> None:
+        # THE LAST PIECE OF A FIXED-WIDTH SPLIT IS SHORT, ALWAYS. textwrap.wrap of a
+        # 43-character key at ten gives 10/10/10/10/3, and the three closed the run
+        # before it could be counted — leaving forty characters, which is not a key,
+        # and a stranded remainder. So a component too short to continue a run is
+        # still tried as its end.
+        widest = run if remainder is None else [*run, remainder]
+        if len(widest) >= 2 and _holds_a_key("".join(parts[index] for index in widest)):
+            suspect.update(widest)
 
     for index, part in enumerate(parts):
-        even = bool(part) and _EVENLY_CHUNKED.fullmatch(part) and len(part) >= 4
+        # THE FLOOR IS FOR STARTING A RUN, NOT FOR ENDING ONE. A remainder can be one
+        # character — wrap(key, 20) gives 20/20/3 — so it is asked about as an end
+        # before the run is closed without it, and only its alphabet matters there.
+        alphabet = bool(part) and bool(_EVENLY_CHUNKED.fullmatch(part))
+        even = alphabet and len(part) >= 4
         if even and (not run or abs(len(part) - len(parts[run[0]])) <= _CHUNK_SLACK):
             run.append(index)
             continue
+        if alphabet and run and len(part) < len(parts[run[0]]):
+            close(index)
         close()
         run = [index] if even else []
     close()
@@ -772,6 +842,8 @@ def opaque_carries_key_material(value: str) -> bool:
     ``application/octet-stream`` folds to 24 characters and prints; 32 unbroken
     characters of base64url is not a content type anybody wrote.
     """
+    if renders_key_bytes(value):
+        return True
     return any(
         _PATH_CHARACTERS.search(spelling) or _PATH_CHARACTERS.search(_aliased(spelling))
         for spelling in _spellings(value)
