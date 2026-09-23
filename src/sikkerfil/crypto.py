@@ -34,12 +34,17 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import ConfigurationError, DecryptionError
+
+#: The base64url alphabet and nothing else — no "+", no "/", no punctuation the
+#: decoder would otherwise discard. Padding is stripped before this is applied.
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*")
 
 #: AES-256. The browser generates the same length and there is no negotiation.
 KEY_BYTES = 32
@@ -116,11 +121,20 @@ def b64url_decode(text: str) -> bytes:
     # transformation — whitespace, then NFKC — which is an open-ended list I would
     # keep losing. Strict decoding closes the set instead: what this accepts is now
     # base64url, plus the whitespace stripped a line above, and nothing else.
-    decoded: bytes | None = None
-    try:
-        decoded = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
-    except (TypeError, ValueError):
+    # THE ALPHABET IS CHECKED HERE, not left to b64decode. validate=True rejects
+    # characters outside the alphabet it is given — but with altchars it accepts BOTH
+    # the base64url "-_" AND standard base64's "+/", so ("A"*10 + "/")*3 + "A"*10 is
+    # 43 characters, decodes to 32 bytes, and carries no run the leak check can see.
+    # "Strict" was not the same as "only base64url", which is the second time on this
+    # branch I have believed a closed set was closed.
+    if not _BASE64URL.fullmatch(compact):
         decoded = None
+    else:
+        decoded = None
+        try:
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (TypeError, ValueError):
+            decoded = None
     if decoded is None:
         raise ValueError(
             f"not base64url: {len(text)} characters that will not decode. The "

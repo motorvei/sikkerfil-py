@@ -63,6 +63,7 @@ from urllib.parse import urlsplit
 
 import certifi
 
+from . import links
 from .errors import (
     ApiError,
     AuthenticationError,
@@ -80,6 +81,11 @@ TOKEN_HEADER = "x-sikkerfil-token"
 
 #: The digest header the edge requires on every signed POST. See the module docstring.
 DIGEST_HEADER = "x-amz-content-sha256"
+
+#: The headers that carry a credential, and therefore must never carry a key.
+#: Derived from the constants above rather than written out again, so a third
+#: credential header cannot quietly escape the check.
+_CREDENTIAL_HEADERS = frozenset({KEY_HEADER, TOKEN_HEADER})
 
 #: The API version every address carries: /api/v1/...
 #:
@@ -223,6 +229,21 @@ class Transport:
             # which is neither one of our errors nor redacted. A control character
             # in a header is also how header injection is spelled, so there are two
             # reasons to refuse it and no reason to allow it.
+            # A DECRYPTION KEY IS NEVER A CREDENTIAL. This is the worst mix-up the
+            # library can be handed: revoke(id, write_token=<the key>) put the key in
+            # x-sikkerfil-token and SENT IT TO THE SERVICE, next to the share id it
+            # opens. Every other leak on this branch was into a log the operator
+            # already had; this one hands the one secret the service is designed
+            # never to hold straight to it, and no amount of redaction downstream
+            # helps because the disclosure is the request itself.
+            if name in _CREDENTIAL_HEADERS and links.looks_like_a_key(value):
+                raise ConfigurationError(
+                    f"the value given for {name} is a decryption key, not a "
+                    "credential. A key opens a file and is never sent to the "
+                    "service — it belongs after '#k=' in a link. A write token is "
+                    "what revoking and auditing need; an API key is what sending "
+                    "needs. The value is not repeated here."
+                )
             if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
                 raise ConfigurationError(
                     f"the {name} header contains a character that cannot be sent: "

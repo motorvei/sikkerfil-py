@@ -254,39 +254,47 @@ def _key_from_fragment(fragment: str) -> str | None:
 
 
 def origin_of(link: str) -> str:
-    """``scheme://host[:port]``, or ``""`` when the address will not parse.
+    """``scheme://host[:port]`` for an http(s) link, or ``""`` when there is none to use.
 
-    THE ONE PLACE THAT DECIDES WHERE A LINK'S ORIGIN ENDS. Everything that needs
-    to name a link without its secrets needs this, and every hand-rolled version
-    of it has been wrong: splitting on ``/`` took a whole key to be the host when
-    a link used ``?`` instead of ``#``, and taking everything before ``/s/``
-    returned the entire link for a NAMED share, fragment and all.
+    THE ONE PLACE THAT DECIDES WHERE A LINK'S ORIGIN ENDS. Everything that needs to
+    name a link without its secrets needs this, and every hand-rolled version has
+    been wrong: splitting on ``/`` took a whole key for the host when a link used
+    ``?`` instead of ``#``, and taking everything before ``/s/`` returned the entire
+    link for a NAMED share.
 
-    urlsplit knows where an authority ends. ``hostname`` rather than ``netloc``,
-    because netloc carries ``user:password@``. The port stays: a port is digits,
-    and a stub or a self-hosted origin needs it to be recognisable.
+    ``hostname`` rather than ``netloc``, because netloc carries ``user:password@``.
+    Brackets go back on an IPv6 literal, which ``hostname`` strips — leaving
+    ``http://::1:5000``, which is not an address, and which broke every IPv6
+    deployment until a review caught it.
 
-    AND THE HOST ITSELF IS NOT TRUSTED, which is the part I had wrong. I wrote
-    down that a hostname is never a secret. Then ``https://<key>/A/B`` — a key
-    pasted where the whole address goes — puts the key in the authority, and
-    ``hostname`` lowercasing it does not make it safe: a 32-byte key can be spelled
-    entirely in lowercase base64url, and a mangled key still gives away nearly all
-    of it. So a host carrying key material is not returned at all — CARRYING, not
-    being, because "<key>.example" is a hostname and still hands over a key.
+    SCHEME RESTRICTED TO http(s), because a 43-character key is also a syntactically
+    valid URI scheme: ``build_link(f"{key}://example.com", …)`` returned the key ahead
+    of the fragment. Nothing this library builds is anything but http or https, so
+    there is no cost to saying so.
+
+    PERCENT-DECODED BEFORE THE KEY CHECK, since urllib decodes a host before it
+    resolves it — so encoding every eleventh character of a key hid it from a check
+    reading the raw text while DNS still saw the whole thing.
+
+    AND THE KEY CHECK IS PER LABEL, at the path threshold, which is a CORRECTION.
+    Running the 12-character value heuristic over a whole hostname rejected
+    ``abcdefghijkl.example`` and ``my-company-files.example.com`` — ordinary names,
+    and self-hosted origins are supported, so that broke real deployments outright
+    while looking like a security improvement. A label is not a value: it is a path
+    component in all but name, and gets the same threshold.
     """
     try:
         parts = urlsplit(link)
         host, port = parts.hostname, parts.port
     except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
         return ""
-    if not parts.scheme or not host or carries_key_material(host):
+    if parts.scheme not in ("http", "https") or not host:
         return ""
-    # BRACKETS BACK ON FOR IPv6. urlsplit's `hostname` strips them — "[::1]" comes
-    # back as "::1" — so reassembling naively gives "http://::1:5000", which is not
-    # a URL. This is not cosmetic: parse_link STORES this as ParsedLink.origin and
-    # the module-level receive()/inspect() install it as the client's base_url, so a
-    # self-hosted or stub service on IPv6 simply stopped working. A regression I
-    # introduced by pointing the operational origin at this function.
+
+    decoded = unquote(host)
+    if any(_run_in(label, _PATH_CHARACTERS) for label in decoded.replace(":", ".").split(".")):
+        return ""
+
     authority = f"[{host}]" if ":" in host else host
     return f"{parts.scheme}://{authority}{f':{port}' if port else ''}"
 

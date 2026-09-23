@@ -19,7 +19,9 @@ crypto.key_text, and one in parse_link that predates it.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -597,3 +599,137 @@ def test_a_sender_cannot_make_the_recipient_write_a_file_named_after_the_key() -
 
     # The recipient is not stuck: they can name it themselves.
     assert hostile.save(directory, filename="rapport.pdf").endswith("rapport.pdf")
+
+
+# --- Round eleven: two of these say an earlier fix of mine was wrong -------------
+
+
+@pytest.mark.parametrize("alias", ["/", "+"])
+def test_standard_base64_aliases_are_not_accepted_as_base64url(alias: str) -> None:
+    """"Strict" was not the same as "only base64url".
+
+    b64decode(..., altchars=b"-_", validate=True) accepts the URL-safe pair AND
+    standard base64's "+/" — so ("A"*10 + "/")*3 + "A"*10 is 43 characters, decodes
+    to 32 bytes, and carries no run the leak check can see. The alphabet is checked
+    here now rather than delegated, which is the second time on this branch I have
+    believed a closed set was closed.
+    """
+    spelled = (("A" * 10 + alias) * 3) + "A" * 10
+    assert len(spelled) == 43
+    with pytest.raises((ConfigurationError, ValueError)):
+        crypto.key_text(spelled)
+
+
+def test_a_decryption_key_is_never_sent_as_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE WORST MIX-UP THE LIBRARY CAN BE HANDED.
+
+    Every other disclosure on this branch went into a log the operator already had.
+    This one sent the key TO THE SERVICE, in x-sikkerfil-token, beside the share id
+    it opens — handing over the one secret the design exists to withhold. No
+    downstream redaction helps, because the request itself is the disclosure.
+    """
+    import urllib.error
+    import urllib.request
+
+    from sikkerfil import Sikkerfil
+
+    sent: dict[str, str] = {}
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.update(dict(request.header_items()))
+        raise urllib.error.URLError("the test does not use the network")
+
+    monkeypatch.setattr(urllib.request, "urlopen", spy)
+
+    client = Sikkerfil(
+        api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9"
+    )
+    with pytest.raises(ConfigurationError, match="decryption key"):
+        client.revoke("ABCD1234", write_token=SECRET)
+    assert not any(_leaks(value) for value in sent.values()), sent
+
+    with pytest.raises(ConfigurationError, match="decryption key"):
+        Sikkerfil(api_key=SECRET, retries=0, base_url="http://127.0.0.1:9").shares()
+    assert not any(_leaks(value) for value in sent.values()), sent
+
+    # A real token still goes, or the guard has broken the feature it protects.
+    sent.clear()
+    with contextlib.suppress(Exception):
+        client.revoke("ABCD1234", write_token="wt_" + "y" * 20)
+    assert any(value.startswith("wt_") for value in sent.values()), sent
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "abcdefghijkl.example",
+        "my-company-files.example.com",
+        "sikkerfil-staging-eu-north.example",
+        "aVeryLongSubdomainLabel.example.com",
+    ],
+)
+def test_an_ordinary_long_hostname_is_still_usable(host: str) -> None:
+    """A CORRECTION TO MY OWN FIX, and the most damaging thing in this round.
+
+    Running the 12-character VALUE heuristic over a whole hostname rejected ordinary
+    names — "my-company-files.example.com" among them — so every self-hosted origin
+    stopped working, in parse_link AND build_link, while looking like a security
+    improvement. A label is a path component in all but name and gets the path
+    threshold. Breaking supported deployments outright is worse than the leak the
+    check was added for.
+    """
+    from sikkerfil.links import origin_of
+
+    # Lowercased, because hostnames are case-insensitive and urlsplit normalises them.
+    # The mixed-case entry is here for that reason: the first version of this test
+    # compared against the input and failed on correct behaviour.
+    expected = f"https://{host.lower()}"
+    assert origin_of(f"https://{host}/s/ABCD1234") == expected
+    assert parse_link(f"https://{host}/s/ABCD1234").origin == expected
+    assert build_link(f"https://{host}", "ABCD1234", SECRET).startswith(expected + "/")
+
+
+def test_a_key_hidden_in_a_host_by_percent_encoding_or_a_scheme_is_refused() -> None:
+    """urllib decodes a host before resolving it, and a key is a valid URI scheme.
+
+    Percent-encoding every eleventh character hid the key from a check reading raw
+    text while DNS would still have seen all of it. And "a"*42 + "g" is both a
+    32-byte key and a syntactically valid scheme, so it reached the front of a link.
+    """
+    from sikkerfil.links import origin_of
+
+    lowercase = crypto.key_text("abcdefghijklmnopqrstuvwxyz0123456789-_abcde")
+    encoded = "".join(
+        f"%{ord(c):02X}" if i % 11 == 10 else c for i, c in enumerate(lowercase)
+    )
+    assert origin_of(f"https://{encoded}/x") == ""
+
+    scheme_shaped = "a" * 42 + "g"
+    assert len(crypto.b64url_decode(scheme_shaped)) == crypto.KEY_BYTES
+    assert origin_of(f"{scheme_shaped}://example.com/x") == ""
+    with pytest.raises(ConfigurationError):
+        build_link(f"{scheme_shaped}://example.com", "ABCD1234", SECRET)
+
+
+def test_a_key_as_base_url_is_refused_at_construction() -> None:
+    """A constructor parameter is a caller value; it just took longer to notice.
+
+    Sikkerfil(base_url=<key>).health() reached urllib, which says what it was given:
+    ValueError("unknown url type: '<the whole key>/api/v1/health'") — in the message
+    and in args, and not one of our errors either.
+    """
+    from sikkerfil import Sikkerfil
+
+    for bad in (SECRET, f"https://{SECRET}", "nonsense"):
+        with pytest.raises(ConfigurationError) as caught:
+            Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=bad, retries=0)
+        assert not _leaks(str(caught.value)), str(caught.value)
+
+    # And a reverse-proxy path prefix still works, since origin_of's answer is used
+    # as a verdict and not as the value.
+    client = Sikkerfil(
+        api_key="sikkerfil_sk_" + "x" * 43, base_url="https://host.example/sikkerfil", retries=0
+    )
+    assert client.base_url == "https://host.example/sikkerfil"

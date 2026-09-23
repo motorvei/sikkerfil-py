@@ -51,6 +51,7 @@ from .links import (
     base_url_for,
     build_link,
     describe,
+    origin_of,
     parse_link,
     redacted,
 )
@@ -98,6 +99,24 @@ class Sikkerfil:
             resolved = base_url_for(market or os.environ.get(ENV_MARKET) or DEFAULT_MARKET)
         elif market is not None:
             raise ConfigurationError("give either market or base_url, not both")
+
+        # CHECKED AS AN ORIGIN, because a base_url reaches urllib and urllib says what
+        # it was given: Sikkerfil(base_url=<a key>).health() raised
+        # ValueError("unknown url type: '<the whole key>/api/v1/health'"), with the key
+        # in the message and in args, and not as one of our errors either. A
+        # constructor parameter is as much a caller value as any other; it just took
+        # longer to notice because the sweep only ever built one safe client.
+        #
+        # origin_of ANSWERS, but its answer is not kept: it drops a path, and somebody
+        # behind a reverse proxy may legitimately pass https://host/sikkerfil. So it is
+        # asked whether this is a usable http(s) origin carrying no key material, and
+        # the caller's own string is what gets used.
+        if not origin_of(resolved):
+            raise ConfigurationError(
+                "base_url must be an http(s) address — a market's front door, or your "
+                "own host. It is not repeated here, in case it carries a key: a "
+                "decryption key is not a base URL, and it is never sent to a server."
+            )
         self.base_url = resolved.rstrip("/")
 
         self._http = Transport(self.base_url, timeout=timeout, retries=retries)

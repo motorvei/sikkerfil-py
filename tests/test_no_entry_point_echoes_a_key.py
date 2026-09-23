@@ -230,6 +230,28 @@ def _callables() -> list[tuple[str, Any]]:
             if callable(obj):
                 found.append((f"{kind}.{name}", obj))
 
+    # CONSTRUCTORS, which excluding every class also skipped. Sikkerfil(base_url=KEY)
+    # reaches urllib and raises ValueError("unknown url type: '<the whole key>/…'") —
+    # in the message AND in args — while the sweep stayed green because it only ever
+    # built one fixed, safe client. A constructor parameter is a string parameter.
+    # NAMED PARAMETERS, not **kwargs: the sweep reads a signature, and a VAR_KEYWORD
+    # has no named parameters to substitute into — so the first version of this was
+    # skipped silently and the anchor below is what said so.
+    def _construct_and_use(
+        api_key: str = "sikkerfil_sk_" + "x" * 43,
+        base_url: str = "http://127.0.0.1:9",
+        market: str | None = None,
+    ) -> object:
+        """Build a client and make it try ONE request; base_url only bites on use."""
+        client = (
+            sikkerfil.Sikkerfil(api_key=api_key, market=market, retries=0)
+            if market is not None
+            else sikkerfil.Sikkerfil(api_key=api_key, base_url=base_url, retries=0)
+        )
+        return client.health()
+
+    found.append(("Sikkerfil(...).health", _construct_and_use))
+
     for module in (links, crypto, cli):
         for name in dir(module):
             obj = getattr(module, name)
@@ -458,6 +480,7 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
         "Sikkerfil.audit(share)",
         "sikkerfil.links.base_url_for(market)",
         "sikkerfil.cli.duration(text)",
+        "Sikkerfil(...).health(base_url)",
         "ReceivedFile.save(directory)",
         "cli.main(argv)",
     ):
