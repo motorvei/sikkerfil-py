@@ -156,3 +156,35 @@ def test_any_bytes_like_spelling_of_the_key_normalises() -> None:
     raw = crypto.b64url_decode(KEY)
     assert crypto.key_text(bytearray(raw)) == KEY
     assert crypto.key_text(memoryview(raw)) == KEY
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        KEY + "\n",  # pasted from a terminal, or read with readline()
+        KEY + "\r\n",  # the same, from a file written on Windows
+        KEY + " ",
+        "  " + KEY + "  ",
+        "\t" + KEY + "\n",
+        KEY + "=\n",  # padded AND newlined, from a config file
+    ],
+)
+def test_whitespace_around_a_key_does_not_break_it(spelling: str) -> None:
+    """THE MECHANISM IS MODULO FOUR, which is why this is parametrised.
+
+    base64 decoding DISCARDS whitespace but COUNTS it when checking padding. So
+    whether a stray character broke a key depended on how many of them there
+    were: one newline made 44 characters, padding was calculated as if none were
+    needed, and the 43 real characters were then rejected as badly padded —
+    while two spaces either side made 47, one '=' was added, and it sailed
+    through. A key surviving a copy-paste must not be a coin flip.
+    """
+    assert crypto.key_text(spelling) == KEY
+
+
+def test_a_key_with_a_newline_still_builds_a_clean_link() -> None:
+    # The regression that prompted the test above was reachable through the
+    # public API, not just the helper: receive() used to .strip() and stopped.
+    assert build_link("https://sikkerfil.no", "ABCD1234", KEY + "\n") == (
+        f"https://sikkerfil.no/s/ABCD1234#k={KEY}"
+    )

@@ -81,8 +81,8 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
     THE SAME KEY HAS THREE SPELLINGS and callers hold whichever one they were
     handed. ``new_key()`` and ``Sealed.key`` are raw bytes; ``Sealed.key_text``
     and a link fragment are base64url text; a key read back out of a config file
-    or a shell variable may have kept its ``=`` padding. They are one key, and
-    anything comparing or publishing them must agree on that.
+    or a shell variable may have kept its ``=`` padding, or a newline. They are
+    one key, and anything comparing or publishing them must agree on that.
 
     WHAT GOES WRONG WITHOUT THIS IS NOT A CRASH. Interpolate the bytes you have
     into a link and you get ``#k=b'\\x9c\\x1f...'`` — plausible length, opens for
@@ -100,8 +100,13 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
     if isinstance(key, (bytes, bytearray, memoryview)):
         raw = bytes(key)
     else:
+        # STRIPPED FIRST, and this is not cosmetic. base64 decoding DISCARDS
+        # whitespace but COUNTS it when checking padding, so whether a stray
+        # newline broke a key depended on how many whitespace characters there
+        # were, modulo four: "key\n" was refused while "  key  " sailed through.
+        # receive() used to .strip() before this moved here; it belongs here.
         try:
-            raw = b64url_decode(key)
+            raw = b64url_decode(key.strip())
         # Both spellings of "not base64url" land here: binascii.Error for bad
         # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
         except (TypeError, ValueError):

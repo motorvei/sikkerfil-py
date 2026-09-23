@@ -361,3 +361,18 @@ def test_a_key_that_opens_nothing_is_refused_before_any_request(
     with pytest.raises(ConfigurationError, match="32 bytes"):
         client.receive("ABCD1234", key=b"too short")
     assert len(stub.requests) == before, "it spoke to the service before checking the key"
+
+
+@pytest.mark.parametrize("trailing", ["\n", "\r\n", " ", "   "])
+def test_a_key_pasted_with_whitespace_still_opens_the_file(
+    client: Sikkerfil, stub, trailing: str
+) -> None:
+    """receive() used to .strip() the key; moving that into key_text dropped it.
+
+    This is the case Codex named: key=sent.key + "\\n", which is what you get
+    from a terminal, a readline() or a config file. Whether it worked depended on
+    how many whitespace characters there were modulo four, because base64
+    decoding discards them but counts them when checking padding.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    assert client.receive(sent.id, key=sent.key + trailing).data == PLAINTEXT

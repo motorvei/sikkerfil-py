@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
-from .crypto import key_text
+from .crypto import KEY_BYTES, b64url_decode, key_text
 from .errors import ConfigurationError
 
 #: The service's own id alphabet — uppercase and digits, 4 to 32 characters.
@@ -83,8 +83,8 @@ def parse_link(link: str) -> ParsedLink:
         if SHARE_NAME.match(head):
             return ParsedLink(origin="", share_id=None, name=head, key=key)
         raise ConfigurationError(
-            f"{redacted(link)!r} is not a share link, a share id "
-            f"({SHARE_ID.pattern}) or a named link ({SHARE_NAME.pattern})"
+            f"{describe(head)}. A share id is {SHARE_ID.pattern} and a named "
+            f"link is {SHARE_NAME.pattern}"
         )
 
     parts = urlsplit(text)
@@ -106,8 +106,9 @@ def parse_link(link: str) -> ParsedLink:
         return ParsedLink(origin=origin, share_id=None, name=path, key=key)
 
     raise ConfigurationError(
-        f"{redacted(link)!r} does not look like a share link. Expected "
-        "https://sikkerfil.no/s/<id>#k=<key> or https://sikkerfil.no/<name>#k=<key>"
+        f"{redacted(link)} does not look like a share link — {describe(path)}. "
+        "Expected https://sikkerfil.no/s/<id>#k=<key> or "
+        "https://sikkerfil.no/<name>#k=<key>"
     )
 
 
@@ -158,16 +159,52 @@ def _key_from_fragment(fragment: str) -> str | None:
 
 
 def redacted(link: str) -> str:
-    """``link`` with the key taken out, for anything that will be read by a human.
+    """``link`` with everything that might be a secret taken out.
 
     THE MODULE DOCSTRING ABOVE SAYS A LOG LINE CARRYING THE FRAGMENT UNDOES THE
     PRODUCT, and an exception message is a log line: applications log what they
-    did not catch, and error trackers keep it. So the message a caller gets names
-    what was wrong with the link — which is always the part BEFORE the ``#`` —
-    and says the key was there without repeating it.
+    did not catch, and error trackers keep it for months.
 
-    A recipient pasting a link whose path we do not recognise is the ordinary
-    case here, not an exotic one, and their link carries a working key.
+    The ORIGIN is kept. It says which market the caller aimed at, which is what
+    they need to see, and it is never a secret.
+
+    THE PATH GOES TOO, not just the fragment. Every caller of this function is
+    about to say it did not recognise the link, so by definition we do not know
+    what its parts are — and one of the things a path can be is the key, from a
+    sender who kept the id and the key separately and pasted the wrong one.
+    Stripping only the fragment left that case fully exposed.
     """
-    head, sep, fragment = link.partition("#")
-    return f"{head}#<key>" if sep and fragment else head
+    origin = link.partition("#")[0].partition("://")
+    if not origin[1]:
+        return "<unrecognised>"
+    host = origin[2].partition("/")[0]
+    return f"{origin[0]}://{host}/<unrecognised>"
+
+
+def describe(value: str) -> str:
+    """Name a value we did not recognise, WITHOUT repeating it.
+
+    We are here because it is not an id, a name or a link, so we do not know what
+    it is. One of the things it can be is the decryption key: a sender who stored
+    the id and the key separately and passed the key where the id belongs gets
+    here, and their key works.
+
+    So the message describes the value instead — and when it IS key-shaped, says
+    so, which is the most useful thing it could say to the caller who got here
+    that way.
+    """
+    if looks_like_a_key(value):
+        return (
+            "that value is a decryption key, not a share id or a name. The key "
+            "goes in key= alongside the id — receive(id, key=…) — or after #k= "
+            "in a link. It is not repeated here, because it is a secret"
+        )
+    return f"a {len(value)}-character value that is not repeated here, in case it is a key"
+
+
+def looks_like_a_key(value: str) -> bool:
+    """Whether ``value`` decodes to something exactly key-sized."""
+    try:
+        return len(b64url_decode(value.strip())) == KEY_BYTES
+    except (TypeError, ValueError):
+        return False

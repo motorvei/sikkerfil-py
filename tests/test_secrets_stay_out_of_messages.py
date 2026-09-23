@@ -30,13 +30,22 @@ from sikkerfil.errors import SikkerfilError
 SECRET = crypto.b64url_encode(bytes(range(4, 36)))
 
 
+#: A run this long is worth having: the rest of a 43-character key is a handful
+#: of guesses away, and nothing legitimate quotes twelve characters of one.
+RUN = 12
+
+
 def _leaks(message: str) -> bool:
     """Any run of the key long enough to be worth having counts as a leak.
 
-    Not just the whole string: a message that prints all but the last character
-    has disclosed a key that is one cheap loop from complete.
+    EVERY OFFSET, not only the start. The first version of this checked prefixes
+    — ``SECRET[:12]``, ``SECRET[:20]`` — and said in its own docstring that it
+    checked runs. A message printing the key from its SECOND character discloses
+    42 of 43, with one 64-way guess left, and that version could not see it. A
+    security test that overstates what it checks is worse than one that does
+    less and says so.
     """
-    return any(SECRET[:n] in message for n in (12, 20, 30, 43)) or SECRET[:-1] in message
+    return any(SECRET[i : i + RUN] in message for i in range(len(SECRET) - RUN + 1))
 
 
 def _broken_things_holding_a_real_key() -> list[tuple[str, Callable[[], object]]]:
@@ -48,6 +57,14 @@ def _broken_things_holding_a_real_key() -> list[tuple[str, Callable[[], object]]
         ("parse_link: unknown path", lambda: parse_link(f"https://sikkerfil.no/A/B/C#k={SECRET}")),
         ("parse_link: bad bare ref", lambda: parse_link(f"UPPER_CASE#k={SECRET}")),
         ("parse_link: not https", lambda: parse_link(f"ftp://sikkerfil.no/s/ABCD1234#k={SECRET}")),
+        # THE KEY ON ITS OWN, with no fragment to strip. A sender who stored the
+        # id and the key separately and passed the key where the id belongs gets
+        # here — and the first version of this sweep did not include it, which is
+        # exactly how the leak it was written to catch stayed in.
+        ("parse_link: the bare key", lambda: parse_link(SECRET)),
+        ("parse_link: the key as a path", lambda: parse_link(f"https://sikkerfil.no/{SECRET}")),
+        ("parse_link: the key with a newline", lambda: parse_link(SECRET + "\n")),
+        ("receive: the bare key", lambda: receive(SECRET)),
         # One character lost or mangled on the way through a mail client.
         ("key_text: a character short", lambda: crypto.key_text(SECRET[:-1])),
         ("key_text: a character extra", lambda: crypto.key_text(SECRET + "x")),
@@ -86,8 +103,16 @@ def test_no_failure_hands_the_key_back_in_its_message(
 
 
 def test_the_guard_can_actually_see_a_leak() -> None:
-    # A test that cannot fail is decoration. This is the shape of the message the
-    # two real leaks produced, so a future 'helpful' f-string is caught.
+    # A test that cannot fail is decoration. These are the shapes the real leaks
+    # produced, so a future 'helpful' f-string is caught.
     assert _leaks(f"{SECRET!r} is not a share link")
     assert _leaks(f"the key {SECRET[:-1]} will not decode")
-    assert not _leaks("'https://sikkerfil.no/A/B/C#<key>' does not look like a share link")
+
+    # AND AT EVERY OFFSET. These three are what the prefix-only version missed.
+    assert _leaks("leaked " + SECRET[1:]), "a suffix leak is still a leak"
+    assert _leaks("leaked " + SECRET[5:35]), "a middle slice is still a leak"
+    assert _leaks(SECRET[-RUN:]), "the last run of the key is still a leak"
+
+    # And it must not fire on the redacted forms, or it would be useless noise.
+    assert not _leaks("https://sikkerfil.no/<unrecognised> does not look like a share link")
+    assert not _leaks("a 43-character value that is not repeated here, in case it is a key")
