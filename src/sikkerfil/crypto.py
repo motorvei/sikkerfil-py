@@ -34,12 +34,17 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .errors import DecryptionError
+from .errors import ConfigurationError, DecryptionError
+
+#: The base64url alphabet and nothing else — no "+", no "/", no punctuation the
+#: decoder would otherwise discard. Padding is stripped before this is applied.
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*")
 
 #: AES-256. The browser generates the same length and there is no negotiation.
 KEY_BYTES = 32
@@ -65,14 +70,146 @@ def b64url_encode(raw: bytes) -> str:
 
 
 def b64url_decode(text: str) -> bytes:
-    """The inverse, tolerating padding whether or not it is there.
+    """The inverse, tolerating padding and whitespace whether or not they are there.
 
     Anything that hands a key back to us — a URL bar, a config file, a shell
-    variable somebody quoted — may or may not have kept the padding. Refusing a
-    correct key over a presentational detail is not a security property.
+    variable somebody quoted, an email that wrapped the line — may or may not have
+    kept the padding, and may have picked up whitespace. Refusing a correct key
+    over a presentational detail is not a security property.
+
+    WHITESPACE IS THE ONLY THING TOLERATED. Anything else outside the base64url
+    alphabet is refused rather than silently dropped — see the comment on
+    ``validate=True`` below, which is the fix that closed a whole class of bypass.
+
+    WHITESPACE GOES BEFORE THE PADDING IS COUNTED, and that order is the whole
+    point. base64 decoding DISCARDS whitespace but the padding calculation COUNTS
+    it, so without this a key with ONE internal space was refused while the same
+    key with TWO was accepted — a coin flip on how much whitespace came along.
+
+    It cannot turn an invalid value into a valid key: 32 bytes needs 43 base64
+    characters, so a key with a character genuinely missing is still short, and
+    every caller that wants a key checks the length.
     """
-    padded = text + "=" * (-len(text) % 4)
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+    # STRIPPED OF PADDING BEFORE PADDING IS ADDED. Computing the padding without
+    # removing what is already there worked only while the decoder was lenient: a key
+    # that arrived as "…3u4==" got three MORE '=' appended, and strict decoding
+    # rightly refuses five. An existing test for a padded key caught it.
+    compact = "".join(text.split()).rstrip("=")
+    padded = compact + "=" * (-len(compact) % 4)
+
+    # THE STDLIB ERROR CARRIES THE VALUE. A UnicodeEncodeError holds the entire
+    # rejected string on `.object` — so a key with one smart quote in it, pasted
+    # into this by a caller following the README, produced an exception with the
+    # key inside it. Neither str() nor the message shows it, which is exactly why
+    # it survived several passes over these messages.
+    #
+    # Still a ValueError, because that is what a decoder raises and what callers
+    # catch (binascii.Error and UnicodeEncodeError are both ValueErrors). Raised
+    # after the handler has exited, so nothing is left on __context__ either.
+    # validate=True, WHICH IS THE ROOT FIX AND NOT A DETAIL. It comes via b64decode
+    # with explicit altchars because urlsafe_b64decode HAS NO validate parameter —
+    # passing one raises TypeError, which my first attempt did, and the catch below
+    # turned that into "every key is invalid". Without it
+    # urlsafe_b64decode silently DISCARDS every character outside the alphabet — not
+    # just the whitespace removed above — so a key with dots sprinkled through it
+    # decoded to the key while looking nothing like one:
+    #
+    #     ".".join(chunks of the key) + "."   ->  decodes to the key
+    #
+    # Every "spelling" bypass on this branch came from that permissiveness, and I had
+    # been answering them one at a time by teaching the LEAK CHECK another
+    # transformation — whitespace, then NFKC — which is an open-ended list I would
+    # keep losing. Strict decoding closes the set instead: what this accepts is now
+    # base64url, plus the whitespace stripped a line above, and nothing else.
+    # THE ALPHABET IS CHECKED HERE, not left to b64decode. validate=True rejects
+    # characters outside the alphabet it is given — but with altchars it accepts BOTH
+    # the base64url "-_" AND standard base64's "+/", so ("A"*10 + "/")*3 + "A"*10 is
+    # 43 characters, decodes to 32 bytes, and carries no run the leak check can see.
+    # "Strict" was not the same as "only base64url", which is the second time on this
+    # branch I have believed a closed set was closed.
+    if not _BASE64URL.fullmatch(compact):
+        decoded = None
+    else:
+        decoded = None
+        try:
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (TypeError, ValueError):
+            decoded = None
+    if decoded is None:
+        raise ValueError(
+            f"not base64url: {len(text)} characters that will not decode. The "
+            "value is not repeated here, because in this library it is usually a "
+            "decryption key."
+        )
+    return decoded
+
+
+def key_text(key: str | bytes | bytearray | memoryview) -> str:
+    """One key, canonically spelled: unpadded base64url, as it appears after ``#k=``.
+
+    THE SAME KEY HAS THREE SPELLINGS and callers hold whichever one they were
+    handed. ``new_key()`` and ``Sealed.key`` are raw bytes; ``Sealed.key_text``
+    and a link fragment are base64url text; a key read back out of a config file
+    or a shell variable may have kept its ``=`` padding, or a newline, or a line
+    wrap. They are one key, and anything comparing or publishing them must agree
+    on that.
+
+    WHAT GOES WRONG WITHOUT THIS IS NOT A CRASH. Interpolate the bytes you have
+    into a link and you get ``#k=b'\\x9c\\x1f...'`` — plausible length, opens for
+    nobody, and the sending side never finds out. Compare the spellings instead of
+    the keys and one key reads as two, so a caller passing a correct key is told
+    it contradicts itself.
+
+    So: bytes are encoded rather than repr'd, padding is dropped, and anything
+    that is not a key is refused by name.
+
+    This signature is wider than the public API's ``str | bytes``, because this is
+    where the widening happens — the callers advertise the two spellings anybody
+    actually holds.
+    """
+    if isinstance(key, (bytes, bytearray, memoryview)):
+        raw = bytes(key)
+    else:
+        # Whitespace and padding are b64url_decode's problem, for every caller
+        # and not just this one — a key pasted into it directly had the same
+        # modulo-four coin flip this function was fixed for.
+        decoded: bytes | None = None
+        try:
+            decoded = b64url_decode(key)
+        # Both spellings of "not base64url" land here: binascii.Error for bad
+        # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
+        except (TypeError, ValueError):
+            decoded = None
+
+        # RAISED OUT HERE, NOT IN THE HANDLER, and that is the whole point of the
+        # flag. `raise ... from None` suppresses how a context is DISPLAYED; it
+        # does not remove the object, and a UnicodeEncodeError carries the entire
+        # rejected string on `.object` — so a near-miss key stayed reachable on
+        # __context__ with a clean message in front of it. Raising after the
+        # handler has exited means there is no context to carry.
+        if decoded is None:
+            # THE VALUE IS NOT IN THIS MESSAGE either, deliberately. A key that
+            # fails to decode is usually a nearly correct key — one character
+            # short, or with a smart quote in it — and repeating it here puts it in
+            # whatever log swallows the traceback.
+            raise ConfigurationError(
+                "a sikkerfil key is base64url text or 32 raw bytes; this is "
+                f"{len(key)} characters that will not decode as base64url. The "
+                "value is not repeated here because it is a decryption key. The "
+                "text is what Sealed.key_text gives you, and what follows #k= in "
+                "a share link."
+            )
+        raw = decoded
+    if len(raw) != KEY_BYTES:
+        raise ConfigurationError(
+            f"a sikkerfil key is {KEY_BYTES} bytes ({KEY_BYTES * 8}-bit AES); this "
+            f"one is {len(raw)}. Something this size opens nothing, so it is "
+            "refused before it becomes a link or a download."
+        )
+    # Re-encoded rather than passed through: '=' in a fragment is legal and gets
+    # helpfully escaped by things that rewrite links, and the browser writes
+    # unpadded, so unpadded is the one spelling everything else can be compared to.
+    return b64url_encode(raw)
 
 
 def new_key() -> bytes:
@@ -80,7 +217,7 @@ def new_key() -> bytes:
     return os.urandom(KEY_BYTES)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Sealed:
     """One encrypted file: the bytes to upload, and the key that opens them."""
 
@@ -93,6 +230,19 @@ class Sealed:
     def key_text(self) -> str:
         """The key as it appears after ``#k=`` in a share link."""
         return b64url_encode(self.key)
+
+    def __repr__(self) -> str:
+        """Without the key. A dataclass repr would have printed it in full.
+
+        ``repr=False`` above is a safety belt rather than the mechanism — a
+        dataclass leaves a ``__repr__`` defined in the body alone — so deleting
+        this method falls back to object's repr instead of a generated one.
+
+        This is the last way the key reached a log without anyone deciding it
+        should: not a message we write, but the DEFAULT repr of an object a
+        caller holds. One ``print(sealed)`` while debugging an upload was enough.
+        """
+        return f"Sealed(blob=<{len(self.blob)} bytes>, key=<hidden>)"
 
 
 def seal(plaintext: bytes, key: bytes | None = None) -> Sealed:

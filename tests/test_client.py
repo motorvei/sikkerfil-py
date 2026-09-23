@@ -11,7 +11,10 @@ that must not be in it.
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import json
+from typing import Any
 
 import pytest
 
@@ -26,10 +29,15 @@ from sikkerfil.transport import API_PREFIX, DIGEST_HEADER, sha256_hex
 
 PLAINTEXT = b"Kvartalsrapport Q3\nOmsetning: 4 200 000 NOK\n"
 
+#: A KEY OF THE SHAPE THE SERVICE MINTS — sikkerfil_sk_ and 43 characters of
+#: base64url, as app/src/key-format.ts spells it. Transport refuses anything else on
+#: the credential header, so "k" used to be enough here only because nothing checked.
+API_KEY = "sikkerfil_sk_" + "a" * 43
+
 
 @pytest.fixture
 def client(stub) -> Sikkerfil:
-    return Sikkerfil(api_key="sikkerfil_sk_" + "a" * 43, base_url=stub.base_url, retries=0)
+    return Sikkerfil(api_key=API_KEY, base_url=stub.base_url, retries=0)
 
 
 # --- The round trip ----------------------------------------------------------
@@ -175,14 +183,14 @@ def test_the_origin_is_sent_only_for_a_real_market(stub) -> None:
     ``bad_origin`` — so the market check is not cosmetic, it is what keeps a
     custom base URL usable at all.
     """
-    client = Sikkerfil(api_key="k", base_url=stub.base_url, retries=0)
+    client = Sikkerfil(api_key=API_KEY, base_url=stub.base_url, retries=0)
     client.send(PLAINTEXT)
     created = json.loads(next(r for r in stub.requests if r.path == f"{API_PREFIX}/shares").body)
     assert "origin" not in created
 
     from sikkerfil.client import Sikkerfil as Real
 
-    real = Real(api_key="k", market="dk")
+    real = Real(api_key=API_KEY, market="dk")
     assert real.base_url == "https://sikkerfil.dk"
 
 
@@ -299,10 +307,10 @@ def test_inspect_reports_metadata_without_downloading(client: Sikkerfil, stub) -
 
 
 def test_a_client_is_configured_from_the_environment(monkeypatch, stub) -> None:
-    monkeypatch.setenv("SIKKERFIL_API_KEY", "sikkerfil_sk_from_env")
+    monkeypatch.setenv("SIKKERFIL_API_KEY", API_KEY)
     monkeypatch.setenv("SIKKERFIL_BASE_URL", stub.base_url)
     client = Sikkerfil()
-    assert client.api_key == "sikkerfil_sk_from_env"
+    assert client.api_key == API_KEY
     assert client.base_url == stub.base_url
 
 
@@ -310,4 +318,379 @@ def test_market_and_base_url_together_is_refused() -> None:
     # They contradict each other and silently preferring one is how somebody
     # ships to the wrong market.
     with pytest.raises(ConfigurationError, match="not both"):
-        Sikkerfil(api_key="k", market="se", base_url="https://example.test")
+        Sikkerfil(api_key=API_KEY, market="se", base_url="https://example.test")
+
+
+def test_the_key_opens_the_file_however_it_is_spelled(client: Sikkerfil, stub) -> None:
+    """One key has three spellings, and a caller holds whichever they were handed.
+
+    ``SentShare.key`` is base64url text, ``Sealed.key`` and ``new_key()`` are raw
+    bytes, and a key that has been through a config file or a shell variable may
+    have kept its ``=`` padding. All three are the same key. Only one of them used
+    to work here.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    raw = crypto.b64url_decode(sent.key)
+
+    for spelling in (sent.key, raw, sent.key + "="):
+        got = client.receive(sent.id, key=spelling)
+        assert got.data == PLAINTEXT, f"{type(spelling).__name__} did not open the file"
+
+
+def test_the_same_key_twice_is_not_two_different_keys(client: Sikkerfil, stub) -> None:
+    """The link's fragment and ``key=`` agreeing must not read as a contradiction.
+
+    The check compared the spellings rather than the keys, so passing the bytes of
+    the very key in the link — or the same text with its padding — was reported as
+    two different keys. A correct caller was told they had made a mistake.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    raw = crypto.b64url_decode(sent.key)
+
+    assert client.receive(sent.url, key=raw).data == PLAINTEXT
+    assert client.receive(sent.url, key=sent.key + "=").data == PLAINTEXT
+
+
+def test_two_genuinely_different_keys_are_still_refused(client: Sikkerfil, stub) -> None:
+    # The check must still do its job: one of them opens the file and the other
+    # does not, and choosing silently means debugging a decryption failure.
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    with pytest.raises(ConfigurationError, match="two different keys"):
+        client.receive(sent.url, key=crypto.new_key())
+
+
+def test_a_key_that_opens_nothing_is_refused_before_any_request(
+    client: Sikkerfil, stub
+) -> None:
+    """It used to reach the service first and then raise TypeError from inside
+    crypto — a traceback about concatenating str to bytes, for a caller who passed
+    a key of the wrong size."""
+    before = len(stub.requests)
+    with pytest.raises(ConfigurationError, match="32 bytes"):
+        client.receive("ABCD1234", key=b"too short")
+    assert len(stub.requests) == before, "it spoke to the service before checking the key"
+
+
+@pytest.mark.parametrize("trailing", ["\n", "\r\n", " ", "   "])
+def test_a_key_pasted_with_whitespace_still_opens_the_file(
+    client: Sikkerfil, stub, trailing: str
+) -> None:
+    """receive() used to .strip() the key; moving that into key_text dropped it.
+
+    This is the case Codex named: key=sent.key + "\\n", which is what you get
+    from a terminal, a readline() or a config file. Whether it worked depended on
+    how many whitespace characters there were modulo four, because base64
+    decoding discards them but counts them when checking padding.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    assert client.receive(sent.id, key=sent.key + trailing).data == PLAINTEXT
+
+
+def test_a_key_shaped_filename_is_not_echoed_but_the_path_around_it_is(
+    client: Sikkerfil, tmp_path
+) -> None:
+    """A path must normally print; a key must never. Settled per COMPONENT.
+
+    "no such file" without the name is the commonest error this library raises, so
+    refusing the whole string is not an option. Only a component that could carry
+    most of a key is replaced, and the directories the caller typed still print —
+    which is usually the half of the message that identifies the mistake anyway.
+    """
+    key_shaped = crypto.b64url_encode(bytes(range(32)))
+
+    with pytest.raises(ConfigurationError) as caught:
+        client.send(str(tmp_path / key_shaped))
+    message = str(caught.value)
+    assert key_shaped[:12] not in message, message
+    assert "43 characters" in message, "it did not say what it withheld"
+    # The directories are still there, or the message identifies nothing.
+    assert str(tmp_path) in message, message
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "rapport.pdf",
+        "data/2026/kvartalsrapport.pdf",
+        "/home/user/Documents/rapport.pdf",
+        "/tmp/pytest-of-user/pytest-63/test_send0/x",  # this suite's own tmp_path shape
+        "kvartalsrapport",  # no extension, fifteen characters
+    ],
+)
+def test_an_ordinary_missing_file_is_still_named_in_full(
+    client: Sikkerfil, path: str
+) -> None:
+    """The redaction must not swallow the normal case, which it did once.
+
+    With the value threshold (twelve) applied to path components, "pytest-of-user"
+    and "test_the_absolute_path_esc0" were both replaced by their lengths — so this
+    suite's own temporary directories came back unreadable. A path component gets
+    the higher PATH_RUN threshold for exactly that reason, and these are the shapes
+    that proved it was needed.
+    """
+    with pytest.raises(ConfigurationError) as caught:
+        client.send(path)
+    assert path in str(caught.value), str(caught.value)
+
+
+def test_the_shares_own_key_passed_as_its_write_token_is_refused(client: Sikkerfil) -> None:
+    """The column mix-up, caught where both values are in hand.
+
+    ``wt_`` in front of a real token means transport can refuse a key on a credential
+    header by shape alone — but only because the service was changed to mint it
+    (sikkerfil#62). This guard does not depend on that: SentShare carries the key and
+    the token, so the two can be compared rather than recognised, and the message can
+    say which of them was handed over.
+
+    Every spelling of the key, because one key has three and a caller holds whichever
+    they were given: bytes are not the mistake anyone makes here, but a padded or
+    line-wrapped paste out of a config file is.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    for spelling in (sent.key, sent.key + "=", sent.key[:21] + "\n" + sent.key[21:]):
+        # THE PHRASE IS THE POINT, and the first version of this test did not have
+        # it: transport's own refusal also contains "DECRYPTION KEY", so matching on
+        # that alone passed with this guard deleted. "this share's" is only sayable
+        # where the share's key is in hand — which is the thing under test.
+        with pytest.raises(ConfigurationError, match=r"this share's DECRYPTION KEY") as caught:
+            client.revoke(sent, write_token=spelling)
+        # And the message does not repeat the thing it is refusing.
+        assert sent.key not in str(caught.value)
+        assert sent.key[:12] not in str(caught.value)
+
+    # The share is still revocable with the token it was actually issued.
+    client.revoke(sent)
+
+
+@pytest.mark.parametrize("slot", ["name", "content_type", "password"])
+def test_a_key_in_a_send_parameter_never_reaches_the_body(
+    slot: str, client: Sikkerfil, stub
+) -> None:
+    """THE BODY IS THE WIRE TOO.
+
+    ``name``, ``content_type`` and ``password`` go to the service as they were given,
+    in the JSON that creates the share. The credential headers were guarded and these
+    were not, so ``send(data, name=<the key>)`` posted the decryption key beside the
+    size and the expiry — to the one party the whole design exists to keep it from.
+
+    With an affix, because that is where "only a value that IS a key" broke: a key
+    with ``user:`` in front of it or ``-old`` after it is not a key to a strict
+    comparison, and carries all 256 bits regardless.
+    """
+    key = crypto.new_key()
+    text = crypto.b64url_encode(key)
+    before = len(stub.requests)
+    for spelling in (text, f"user:{text}", f"{text}-old", text + "=="):
+        given: dict[str, Any] = {slot: spelling}
+        with pytest.raises(ConfigurationError) as caught:
+            client.send(PLAINTEXT, **given)
+        assert text not in str(caught.value)
+        assert "decryption key" in str(caught.value)
+    assert len(stub.requests) == before, "the share was created before the refusal"
+
+    # And an ordinary value of each still goes through, or the guard has taken the
+    # feature away rather than protected it.
+    ordinary: dict[str, Any] = {
+        slot: {
+            "name": "kvartalsrapport-2026-q3",
+            "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "password": "hemmelig-passord",
+        }[slot]
+    }
+    client.send(PLAINTEXT, **ordinary)
+
+
+def test_a_key_as_the_receive_password_never_reaches_the_download(
+    client: Sikkerfil, stub
+) -> None:
+    """THE LIKELIER OF THE TWO MIX-UPS, and the one the send() guard did not cover.
+
+    A recipient holds a link and a password in the same hand, so
+    ``receive(link, password=<the link's own key>)`` is an ordinary slip — and it
+    posted the key that opens the file to the service that stores it, in the request
+    that asks for it. Only send()'s three parameters were guarded.
+
+    Checked against the stub rather than a dead port, because receive() reads the
+    share's metadata first: pointed at a closed socket it fails on that request and
+    never assembles the download body, which is why this leak did not show up in the
+    sweep's own network-refusing fixture.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    before = len(stub.requests)
+    for spelling in (sent.key, f"user:{sent.key}", sent.key + "-old"):
+        with pytest.raises(ConfigurationError) as caught:
+            client.receive(sent.url, password=spelling)
+        assert "decryption key" in str(caught.value)
+        assert sent.key not in str(caught.value)
+    assert len(stub.requests) == before, "a request went out before the refusal"
+
+    # A password that is a password still gets through to the service.
+    with contextlib.suppress(Exception):
+        client.receive(sent.url, password="hemmelig")
+    posted = [r for r in stub.requests[before:] if r.body and b"hemmelig" in r.body]
+    assert posted, "an ordinary password no longer reaches the download"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        ("A" * 10 + "/") * 3 + "A" * 10,  # standard base64's alphabet
+        ("A" * 10 + "+") * 3 + "A" * 10,
+    ],
+)
+def test_a_standard_base64_key_never_reaches_a_request_body(
+    spelling: str, client: Sikkerfil, stub
+) -> None:
+    """THE WIRING, not the predicate.
+
+    ``opaque_carries_key_material`` had a test and the three call sites did not, so
+    swapping them back to the path predicate — which splits on "/" and reads this as
+    four short components — broke nothing at all. The predicate being right is not
+    the property; what send() and receive() actually ask is.
+    """
+    before = len(stub.requests)
+    for slot in ("password", "name", "content_type"):
+        given: dict[str, Any] = {slot: spelling}
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, **given)
+    assert len(stub.requests) == before
+
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    before = len(stub.requests)
+    with pytest.raises(ConfigurationError):
+        client.receive(sent.url, password=spelling)
+    assert len(stub.requests) == before
+
+
+def test_a_long_registered_content_type_reaches_the_service(client: Sikkerfil, stub) -> None:
+    """THROUGH send(), not through the predicate.
+
+    ``mimetypes.guess_type("x.cii")`` returns a 54-character media type, and the run
+    threshold refused it — while leaving the argument out sent the identical value,
+    because ``_guess_type`` generates it. A guard that refuses what the library itself
+    produces is a bug with a security-shaped excuse.
+
+    The predicate had a test and this call site did not, so swapping the check back to
+    the run heuristic broke nothing.
+    """
+    import mimetypes
+
+    guessed = mimetypes.guess_type("x.cii")[0]
+    assert guessed and len(guessed) > 32
+
+    client.send(PLAINTEXT, filename="x.cii", content_type=guessed)
+    created = json.loads(stub.requests[-3].body)
+    assert created["contentType"] == guessed
+
+    # Leaving it out sends the same thing, which is the inconsistency that made the
+    # refusal indefensible.
+    client.send(PLAINTEXT, filename="x.cii")
+    assert json.loads(stub.requests[-3].body)["contentType"] == guessed
+
+    # A key with a separator pushed into it is still refused: the grammar accepts it
+    # and deleting the slash gives back the key.
+    key = crypto.b64url_encode(bytes(range(32)))
+    for shaped in (f"{key[:20]}/{key[20:]}", key, "A" * 20 + "/" + "A" * 22):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=shaped)
+
+
+def test_a_parameterised_content_type_reaches_the_service(client: Sikkerfil, stub) -> None:
+    """``text/plain; charset=utf-8`` is an ordinary Content-Type.
+
+    My first version of the media-type grammar took only the bare type/subtype, so
+    fixing one over-refusal in this parameter introduced another one round later.
+
+    And allowing parameters opens a place to put a key that none of the other
+    questions reach — "text/plain; charset=<a key>" is a valid media type and is not
+    a rendering of anything as a whole string — so each parameter value is asked
+    about on its own. Nobody reported that; it arrived with the fix.
+    """
+    for accepted in (
+        "text/plain; charset=utf-8",
+        "text/plain;charset=utf-8",
+        'text/csv; charset="utf-8"',
+        "multipart/form-data; boundary=----abc",
+    ):
+        client.send(PLAINTEXT, content_type=accepted)
+        assert json.loads(stub.requests[-3].body)["contentType"] == accepted
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    before = len(stub.requests)
+    for refused in (
+        f"text/plain; charset={key}",
+        f'text/plain; charset="{key}"',
+        f"text/plain; charset={base64.b85encode(bytes(range(32))).decode()}",
+        "text/plain; charset",
+    ):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=refused)
+    assert len(stub.requests) == before
+
+
+def test_a_key_in_any_content_type_token_is_refused(client: Sikkerfil, stub) -> None:
+    """THE TYPE, THE SUBTYPE, A PARAMETER NAME, AND AN ESCAPED VALUE.
+
+    My previous version looked at the whole value, the slash-deleted value, and the
+    text after each "=" — three places out of five. ``text/<a key>`` and
+    ``text/plain; <a key>=x`` are both valid media types whose surrounding text makes
+    the whole string too long to decode, and a quoted value can spell the key with a
+    backslash before every tenth character: the grammar allows the escapes, HTTP
+    removes them, and my check read the string with them still in.
+    """
+    key = crypto.b64url_encode(bytes(range(32)))
+    escaped = "\\".join(key[i : i + 10] for i in range(0, len(key), 10))
+    before = len(stub.requests)
+    for refused in (
+        f"text/{key}",
+        f"{key}/plain",
+        f"text/plain; {key}=x",
+        f'text/plain; k="{escaped}"',
+        f'text/plain; k="{bytes(range(32)).hex(".")}"',
+        f'text/plain; k="{base64.b32encode(bytes(range(32))).decode()}"',
+        # A SEMICOLON INSIDE A QUOTED VALUE IS DATA. Splitting on every semicolon made
+        # the tail a parameter NAME, so the quoted-pair unescaping — which only runs
+        # on values — never saw it, and a compliant consumer unescapes it to the key.
+        'text/plain; note="safe;' + "\\" + "\\".join(bytes(range(32)).hex()) + '"',
+        # AND A RENDERING WITH ORDINARY TEXT AROUND IT. The whole token is not a
+        # rendering; sixty-four of its characters are.
+        f'text/plain; k="prefix{bytes(range(32)).hex()}suffix"',
+        f'text/plain; k="see {base64.b32encode(bytes(range(32))).decode()} ok"',
+    ):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=refused)
+    assert len(stub.requests) == before, "a request went out before the refusal"
+
+    # THE TRADE, ASSERTED SO THAT IT STAYS A DECISION. A key rendered in base85 is
+    # NOT refused here any more, and this test asserted that it was until the round
+    # that found the cost: base85 is forty characters of an alphabet covering nearly
+    # everything printable, and z85 — present from 3.13 — decodes both forty and
+    # forty-one. That test refused application/tamp-community-update-confirm, a type
+    # mimetypes hands out and _guess_type sends when content_type is left out.
+    #
+    # A media type is a registered token whose length nobody chose, so a length test
+    # has nothing to say about it. Somebody who renders their key in base85 and pastes
+    # it into content_type is not making a mistake this library can tell apart from a
+    # media type. In the PASSWORD slot, where the cost is one caller's password rather
+    # than a value the library itself sends, the length tests still apply.
+    import mimetypes
+
+    registered = mimetypes.guess_type("x.cuc")[0]
+    assert registered == "application/tamp-community-update-confirm"
+    client.send(PLAINTEXT, content_type=registered)
+    assert json.loads(stub.requests[-3].body)["contentType"] == registered
+
+    # And in the PASSWORD slot, where the cost is one caller's password rather than a
+    # value the library itself sends, the length tests still apply.
+    with pytest.raises(ConfigurationError):
+        client.send(PLAINTEXT, password=base64.a85encode(b" " * 32, foldspaces=True).decode())
+
+    # And the Content-Type values a real caller sends, including a boundary of the
+    # length people actually generate.
+    for accepted in (
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+        'text/csv; charset="utf-8"',
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ):
+        client.send(PLAINTEXT, content_type=accepted)
+        assert json.loads(stub.requests[-3].body)["contentType"] == accepted

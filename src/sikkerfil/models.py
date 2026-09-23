@@ -21,6 +21,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from . import links
+from .errors import ConfigurationError
+from .links import origin_of
+
+#: ``repr=False`` on the classes below is a SAFETY BELT, not the mechanism. A
+#: dataclass does not overwrite a ``__repr__`` defined in the class body, so the
+#: explicit ones are what take effect either way. It matters if one of them is
+#: ever deleted: with ``repr=False`` the class falls back to object's repr, which
+#: shows no fields, instead of silently regaining a generated one that prints the
+#: key. No test can tell the difference today, which is why it is written down.
+
 
 def _utc(epoch: int) -> datetime:
     return datetime.fromtimestamp(epoch, tz=timezone.utc)
@@ -71,7 +82,7 @@ class Share:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class SentShare:
     """The result of a send: a link to give somebody, and a token to keep.
 
@@ -99,8 +110,32 @@ class SentShare:
     def expires(self) -> datetime:
         return _utc(self.expires_at)
 
+    def __repr__(self) -> str:
+        """Without the key, the link's fragment, or the write token.
 
-@dataclass(frozen=True)
+        THE DEFAULT REPR PUT ALL THREE IN EVERY LOG THAT TOUCHED THIS OBJECT.
+        ``logger.info("sent %s", sent)`` is an ordinary line to write, and it
+        wrote the decryption key and the once-issued write token into whatever
+        the application logs to. The caller chose to hold those; they did not
+        choose to print them.
+
+        What is left is what identifies the share — the id, the market, when it
+        expires — which is what anyone reading a log actually wants.
+
+        THE FIRST VERSION OF THIS LEAKED. It took everything before ``/s/`` as the
+        origin, and ``partition`` returns the WHOLE string when the separator is
+        absent — so a NAMED link, which has no ``/s/``, came back complete with its
+        fragment. Hence origin_of, which is the one place that answers this.
+        """
+        return (
+            f"SentShare(id={self.id!r}, origin={origin_of(self.url)!r}, "
+            f"expires_at={self.expires_at}, size_bytes={self.size_bytes}, "
+            f"name={self.name!r}, url=<carries the key>, "
+            f"key=<hidden>, write_token=<hidden>)"
+        )
+
+
+@dataclass(frozen=True, repr=False)
 class ReceivedFile:
     """A decrypted file, in memory.
 
@@ -117,6 +152,22 @@ class ReceivedFile:
     def __len__(self) -> int:
         return len(self.data)
 
+    def __repr__(self) -> str:
+        """Without the plaintext, AND WITHOUT THE FILENAME.
+
+        The file bytes are obviously the thing being protected. The name is less
+        obvious and is the reason ``encryptedName`` exists at all: the service
+        never learns it, because "oppsigelse-ansatt-4412.pdf" gives away the
+        document without a byte of it. Decrypting it locally and then printing it
+        into the application's logs hands back exactly what sealing it bought —
+        which makes masking the bytes and not the name no protection at all.
+        """
+        named = "a sealed name" if self.filename else "no name"
+        return (
+            f"ReceivedFile({named}, content_type={self.content_type!r}, "
+            f"data=<{len(self.data)} bytes>, share={self.share.id!r})"
+        )
+
     def save(self, directory: str = ".", *, filename: str | None = None) -> str:
         """Write the bytes to disk and return the path written.
 
@@ -132,9 +183,52 @@ class ReceivedFile:
         fails outright — and ``save("~/Downloads")`` is the obvious thing to
         write.
         """
+        # THE DIRECTORY IS A CALLER VALUE TOO, and a key pasted into it came back
+        # out through FileNotFoundError.filename — which holds the joined path, and
+        # which nothing in the message shows. This is the receiving side of the same
+        # mix-up as send(<key>): refused before the open, by the same rule, so the
+        # standard library never sees it.
+        if links.path_carries_key_material(directory):
+            raise ConfigurationError(
+                "that directory carries what looks like a decryption key, so it is "
+                "not repeated here. Pass the directory to write into — save('.') or "
+                "save('~/Downloads') — and keep the key out of it."
+            )
         chosen = filename or self.filename or f"sikkerfil-{self.share.id}.bin"
+
+        # CHECKED AFTER CHOOSING, which is the whole point. The first version tested
+        # the explicit `filename` argument only — and self.filename is the DECRYPTED
+        # name, which the docstring above already calls attacker-controlled. So a
+        # sender could send(data, filename=<a key>) and the recipient's perfectly
+        # ordinary save(dir) wrote a file named after it, no mistake required at the
+        # receiving end at all. Guarding the argument and not the value it defaults to
+        # protected the caller from themselves and not from the sender.
+        #
+        # It CREATES A FILE, so this is worse than a message: directory listings,
+        # backups, whatever indexes that folder, and one `git add -A` from a commit.
+        if links.path_carries_key_material(chosen):
+            raise ConfigurationError(
+                "the name this file would be saved under carries what looks like a "
+                "decryption key, so it is not repeated here — writing it would put "
+                "the key in the filesystem. Pass filename= to choose another name. "
+                "If it came sealed with the file, the sender put it there."
+            )
         safe = os.path.basename(chosen.replace("\\", "/")).lstrip(".") or f"{self.share.id}.bin"
         path = os.path.join(os.path.expanduser(directory), safe)
+        # AND THE JOINED PATH, which neither of the two checks above can see. A
+        # rendering that contains separators is split by them: b64encode of 32 bytes
+        # is "Pz8/Pz8/…/Pz8=", which os.path.split turns into ten three-character
+        # directories and a four-character filename, so the directory check and the
+        # name check both pass and open() receives the whole recoverable thing —
+        # writing it into the filesystem, or naming it in FileNotFoundError.filename.
+        # The same route runs through the CLI's `receive -o`.
+        if links.joined_path_spells_a_key(path):
+            raise ConfigurationError(
+                "the path this file would be written to carries what looks like a "
+                "decryption key once the directory and the name are joined. It is "
+                "not repeated here. Pass a directory and a filename that do not "
+                "spell one — save('.', filename='rapport.pdf')."
+            )
         with open(path, "wb") as handle:
             handle.write(self.data)
         return path

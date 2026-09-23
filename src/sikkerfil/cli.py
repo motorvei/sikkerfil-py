@@ -24,14 +24,36 @@ import os
 import re
 import sys
 from collections.abc import Sequence
+from typing import NoReturn
 
 from . import __version__
 from .client import Sikkerfil, _client_for
 from .errors import ConfigurationError, SikkerfilError
-from .links import DEFAULT_MARKET, MARKETS
+from .links import DEFAULT_MARKET, MARKETS, quoted, scrubbed
 
 _DURATION = re.compile(r"^(\d+)\s*([smhdw]?)$", re.IGNORECASE)
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "": 1}
+
+
+def count(text: str) -> int:
+    """A positive integer, refused WITHOUT echoing what was given.
+
+    argparse's own ``type=int`` formats a failure as "invalid int value: '<the value>'"
+    and writes it to stderr itself — so ``--max-downloads <a key>`` printed the key
+    before any of our code ran. Same mechanism as ``choices=``, which was removed from
+    ``--market`` for the same reason, and which I fixed there without looking for
+    other argparse-owned conversions.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f"{quoted(text)} is not a whole number. It is not repeated here if it "
+            "might be a key: a decryption key is not a count."
+        )
+    return value
 
 
 def duration(text: str) -> int:
@@ -39,22 +61,66 @@ def duration(text: str) -> int:
     match = _DURATION.match(text.strip())
     if not match:
         raise argparse.ArgumentTypeError(
-            f"{text!r} is not a duration; use 3600, 30m, 24h or 7d"
+            f"{quoted(text)} is not a duration; use 3600, 30m, 24h or 7d"
         )
     return int(match.group(1)) * _UNITS[match.group(2).lower()]
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+class _Parser(argparse.ArgumentParser):
+    """An argparse parser whose own error messages cannot echo a key.
+
+    ``error()`` is the one funnel every argparse refusal goes through — a bad
+    choice, a bad conversion, a missing argument, an unrecognised one — and each of
+    them formats the offending value into the message and writes it to stderr
+    itself. Overriding it covers the ones I have not thought of, which is the point:
+    I fixed this option by option twice and a third slot was still open.
+
+    Subparsers inherit this class, because add_subparsers defaults parser_class to
+    the type of the parser it is called on — and each one is handed the same argv, so
+    a refusal from a subparser can redact by identity too.
+    """
+
+    #: The argv this parser was asked to read, so error() can take a value out of a
+    #: message BY IDENTITY rather than by recognising it. " ".join(key) has no run
+    #: for a pattern to find and is not a whole key either; it is, however, exactly
+    #: the string that was passed in.
+    given: Sequence[str] = ()
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {scrubbed(message, self.given)}\n")
+
+
+def parsers(parser: argparse.ArgumentParser) -> list[_Parser]:
+    """``parser`` and every subparser under it."""
+    found = [parser] if isinstance(parser, _Parser) else []
+    # argparse exposes no public walk of its own parsers, so this reads two private
+    # attributes. They have been stable since argparse entered the standard library,
+    # and the alternative is keeping a second list of subparsers in step by hand.
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            found.extend(p for p in action.choices.values() if isinstance(p, _Parser))
+    return found
+
+
+def _parser_for(given: Sequence[str]) -> _Parser:
+    """The whole command line, with ``given`` handed to every parser in it."""
+    parser = _Parser(
         prog="sikkerfil",
         description="Encrypted file transfer that stays inside Scandinavia.",
         epilog="Protocol documentation: https://sikkerfil.no/utviklere",
     )
     parser.add_argument("--version", action="version", version=f"sikkerfil {__version__}")
+    # NO choices= HERE, deliberately. argparse formats a rejected choice as
+    # "invalid choice: %(value)r" and writes it to stderr itself, so `--market
+    # <a key>` printed the key and never reached base_url_for, which exists to
+    # refuse it without echoing. Validated below instead, by the one function that
+    # already knows how — the help text still lists the markets, so nothing is lost
+    # but the leak.
     parser.add_argument(
         "--market",
-        choices=sorted(MARKETS),
         default=None,
+        metavar="{" + ",".join(sorted(MARKETS)) + "}",
         help=f"which front door to use (default: {DEFAULT_MARKET})",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -63,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     send.add_argument("file", help="the file to send, or - for stdin")
     send.add_argument("--name-as", metavar="NAME", help="seal this filename instead")
     send.add_argument("--expires", type=duration, metavar="DURATION", help="e.g. 24h, 7d")
-    send.add_argument("--max-downloads", type=int, metavar="N")
+    send.add_argument("--max-downloads", type=count, metavar="N")
     send.add_argument("--password", metavar="SECRET", help="an extra secret the recipient needs")
     send.add_argument("--link-name", metavar="NAME", help="claim sikkerfil.no/NAME")
     send.add_argument("--json", action="store_true", help="print the full result as JSON")
@@ -89,6 +155,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit.add_argument("--write-token", required=True)
     audit.add_argument("--csv", action="store_true", help="the form a DPO files")
 
+    # EVERY PARSER GETS THE SAME argv, the subparsers included. Nothing I could find
+    # makes a SUBparser format a caller value into a message — our own converters
+    # take that job, and they go through quoted() — but the point of putting the
+    # redaction in error() was to stop enumerating which messages carry values, and
+    # leaving one parser out of that would be enumerating again with extra steps.
+    # There is a test that calls error() on each parser in turn, because a property
+    # that holds only where I happened to look is the thing this file keeps proving
+    # wrong.
+    for each in parsers(parser):
+        each.given = list(given)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _parser_for(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
 
     try:

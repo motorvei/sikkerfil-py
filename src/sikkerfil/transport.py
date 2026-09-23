@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import ssl
 import time
 import urllib.error
@@ -63,10 +64,12 @@ from urllib.parse import urlsplit
 
 import certifi
 
+from . import links
 from .errors import (
     ApiError,
     AuthenticationError,
     BudgetError,
+    ConfigurationError,
     NotFoundError,
     SignatureError,
     TransportError,
@@ -79,6 +82,48 @@ TOKEN_HEADER = "x-sikkerfil-token"
 
 #: The digest header the edge requires on every signed POST. See the module docstring.
 DIGEST_HEADER = "x-amz-content-sha256"
+
+#: WHAT THE SERVICE ACTUALLY MINTS, read out of its source and not assumed:
+#: ``KEY_PATTERN`` in app/src/key-format.ts and ``WRITE_TOKEN_PATTERN`` in
+#: app/src/ids.ts. Checked POSITIVELY, because the thing being kept off the wire is
+#: a decryption key, and "not a key" is a far weaker statement than "is one of the
+#: two shapes a credential comes in".
+#:
+#: THE ASSUMPTION IS WHY THIS IS WRITTEN OUT WITH ITS SOURCE. The first version of
+#: this check simply required a credential to start with ``sikkerfil_sk_`` or
+#: ``wt_`` — and the service had never minted a ``wt_`` anything. A write token was
+#: ``randomBytes(32).toString("base64url")``, so the check refused EVERY GENUINE
+#: TOKEN: revoke() and audit() would have raised for every real caller on their
+#: first call. Nothing here caught it, because conftest minted ``wt-<id>`` and both
+#: /utviklere and this library's README documented ``wt_…`` — a test double and two
+#: documents agreeing with each other and not with the code that mints the value.
+#:
+#: The service now mints the prefix the documentation promised (sikkerfil#62), and
+#: that is what makes the token shape worth checking: a write token and a
+#: decryption key were previously the SAME SHAPE — 43 characters of base64url,
+#: character for character — so no test of the value could tell them apart, and the
+#: mix-up this guard exists for (revoke(id, write_token=<the key>)) was undecidable
+#: here. With ``wt_`` in front of a real token, a key handed over whole is refused,
+#: and so is every near miss: one character short, still carrying ``=`` padding,
+#: wrapped across two lines, or spelled in standard base64 with ``+/``.
+#:
+#: A token issued before that deploy has no prefix and is refused by name. That is
+#: deliberate rather than overlooked: this library is not published yet, so no
+#: caller holds one, and accepting a bare 43-character value on this header would
+#: mean accepting a decryption key on it — which is the disclosure the whole check
+#: exists to prevent.
+_API_KEY = re.compile(r"sikkerfil_sk_[A-Za-z0-9_-]{43}")
+_WRITE_TOKEN = re.compile(r"wt_[A-Za-z0-9_-]{43}")
+
+#: The prefixes those two shapes put in front of their 43 characters. Exported
+#: because client._same_key has to take one off before it can compare a credential
+#: with a key: "wt_" + the share's own key is a perfectly shaped write token, and
+#: the thing behind the prefix is the file's key.
+CREDENTIAL_PREFIXES = ("wt_", "sikkerfil_sk_")
+
+#: Keyed on the header constants rather than repeating their spellings, so a third
+#: credential header cannot quietly escape the check.
+_CREDENTIAL_SHAPES = {KEY_HEADER: _API_KEY, TOKEN_HEADER: _WRITE_TOKEN}
 
 #: The API version every address carries: /api/v1/...
 #:
@@ -203,6 +248,106 @@ class Transport:
     ) -> tuple[bytes, dict[str, str]]:
         headers.setdefault("user-agent", self.user_agent)
         headers.setdefault("accept", "application/json")
+
+        # CHECKED HERE, BEFORE http.client ENCODES THEM. A header value that is not
+        # latin-1 raises UnicodeEncodeError from inside the standard library, and
+        # that exception carries the WHOLE VALUE on `.object` — so a credential with
+        # one smart quote in it, which is what a paste out of a document or a chat
+        # window produces, came back out inside a stdlib error. It was not even a
+        # SikkerfilError, so a caller catching ours never saw it coming.
+        #
+        # Every credential this library sends is ASCII by construction —
+        # sikkerfil_sk_… or base64url — so a value that is not is a caller mistake,
+        # and it is refused by NAME rather than by value.
+        for name, value in headers.items():
+            # THE NAME IS SENT TOO, and every safeguard below was applied only to the
+            # value. A key is a valid HTTP field name — get_json(path, headers={key:
+            # "x"}) put all forty-three characters on the wire as a header NAME, and
+            # the refusals further down interpolate the name into their message, so a
+            # bad value echoed the key locally as well. Transport is public; a caller
+            # building headers from a dict they assembled can invert a pair.
+            #
+            # THE MEDIA-TYPE PREDICATE, NOT THE DEGENERATE ONE, and the numbers chose
+            # it. A header name is a registered token whose length nobody picked, so a
+            # length test has nothing to say about it: holds_a_key refuses
+            # x-amz-server-side-encryption-customer-key-md5, and renders_key_bytes
+            # refuses x-amz-server-side-encryption-customer-key — the second on 3.13
+            # only, which is the interpreter-dependence fixed in the same round. What
+            # is asked is what a media type is asked: is this EXACTLY a key, or does
+            # it hold a rendering whose alphabet means something.
+            #
+            # The gap, named rather than found later: a key with DECORATION on it as a
+            # header name — "x-key-<a key>" — is not caught, because catching it means
+            # refusing the AWS names above. A bare key is the mistake that happens.
+            # A NAME THAT IS NOT A FIELD NAME IS REFUSED FIRST, and unredacted, which
+            # is two leaks in one. "<a key>:" is not a token, so the predicate below
+            # does not recognise it — and then the value checks interpolate the name
+            # into their message, printing the key locally; with a valid value,
+            # http.client raises ValueError carrying the same name. Neither needed the
+            # decorated-name trade-off to be reopened: a field name is
+            # [!#$%&'*+.^_`|~0-9A-Za-z-]+ by RFC 9110, and anything else was never
+            # going to be sent anyway. Refusing it here, by shape, without repeating
+            # it, closes both without costing a single legitimate header.
+            if not _HTTP_FIELD_NAME.fullmatch(name):
+                raise ConfigurationError(
+                    "a header name given is not a valid HTTP field name. It must be "
+                    "letters, digits or !#$%&'*+-.^_`|~ — no spaces, no colon, no "
+                    "control characters, nothing outside ASCII. The name is not "
+                    "repeated here, because a name this library is handed can be a "
+                    "credential or a decryption key by mistake, and nothing was sent."
+                )
+            if _a_key_is_the_header_name(name):
+                raise ConfigurationError(
+                    "a header name given carries what looks like a decryption key. A "
+                    "header name is sent to the service exactly as a value is, so a "
+                    "key used as one is handed to the party that must never hold it. "
+                    "The key belongs after '#k=' in a link. The name is not repeated "
+                    "here, and nothing was sent."
+                )
+            # ASCII IS NOT ENOUGH, which is where the first version of this stopped.
+            # CR and LF are ASCII, so a credential wrapped across two lines in a
+            # config file sailed through — and then http.client's own validation
+            # raised ValueError("Invalid header value b'<the whole credential>'"),
+            # which is neither one of our errors nor redacted. A control character
+            # in a header is also how header injection is spelled, so there are two
+            # reasons to refuse it and no reason to allow it.
+            # A DECRYPTION KEY IS NEVER A CREDENTIAL. This is the worst mix-up the
+            # library can be handed: revoke(id, write_token=<the key>) put the key in
+            # x-sikkerfil-token and SENT IT TO THE SERVICE, next to the share id it
+            # opens. Every other leak on this branch was into a log the operator
+            # already had; this one hands the one secret the service is designed
+            # never to hold straight to it, and no amount of redaction downstream
+            # helps because the disclosure is the request itself.
+            # LOWERCASED, BECAUSE HTTP HEADER NAMES ARE CASE-INSENSITIVE. This
+            # library spells them through the constants, so nothing here missed the
+            # check — but a caller using Transport directly with the conventional
+            # "X-Sikkerfil-Token" got a dict miss and an unchecked credential, and
+            # the service reads that header just the same. A guard keyed on one
+            # spelling of a case-insensitive name is a guard with a spelling bypass.
+            shape = _CREDENTIAL_SHAPES.get(name.lower())
+            if shape is not None and not shape.fullmatch(value):
+                expected = (
+                    "an API key is sikkerfil_sk_ and then 43 characters of base64url"
+                    if name.lower() == KEY_HEADER
+                    else "a write token is wt_ and then 43 characters, exactly as "
+                    "the service returned it as writeToken when the share was created"
+                )
+                raise ConfigurationError(
+                    f"the value given for {name} is not shaped like a credential: "
+                    f"{expected}. A DECRYPTION KEY is what this most often is by "
+                    "mistake, and it must never be sent to the service — it opens "
+                    "the file, and belongs only after '#k=' in a link. A write token "
+                    "is what revoking and auditing need; an API key is what sending "
+                    "needs. The value is not repeated here, and nothing was sent."
+                )
+            if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
+                raise ConfigurationError(
+                    f"the {name} header contains a character that cannot be sent: "
+                    "it must be printable ASCII. The value is not repeated here, "
+                    "because the headers this library sets carry credentials. A "
+                    "smart quote from a copied document, or a credential wrapped "
+                    "across two lines, is the usual cause."
+                )
 
         attempt = 0
         while True:
@@ -353,3 +498,19 @@ def _retry_after(headers: Mapping[str, str]) -> int:
         return int(headers.get("retry-after", "3600"))
     except ValueError:
         return 3600
+
+
+#: An HTTP field name, per RFC 9110's token rule. Anything outside it cannot be sent,
+#: so refusing it here is free — and it must happen before any message repeats it.
+_HTTP_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
+def _a_key_is_the_header_name(name: str) -> bool:
+    """Whether an HTTP field name is a key, or holds a rendering with an alphabet.
+
+    Deliberately the same question ``_a_key_hides_in`` asks of a media type's tokens,
+    for the same reason: both are names whose length somebody else chose, so "forty
+    characters" and "forty-three characters" say nothing about them. See the comment
+    at the call site for the two real header names that proved it.
+    """
+    return links.a_key_hides_in_a_token(name)

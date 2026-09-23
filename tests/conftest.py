@@ -8,6 +8,16 @@ transport asserts that we called ourselves the way we expected to call ourselves
 which is exactly the class of bug it cannot see. This runs a real HTTP server on
 a real loopback port and records what actually arrived.
 
+A HAZARD FOR THE WAY THIS SUITE IS USED. Every fix in this repository is checked by
+reverting it and counting the failures, and that method has a way of lying: CPython
+validates a cached ``.pyc`` against the source's mtime in WHOLE SECONDS and its size
+in bytes. Restore a file within the same second as the cache was written, with the
+same size — which "2" changing back from "5" is — and the stale bytecode is loaded,
+so the revert measures the code you thought you put back. It happened once here, and
+the only reason it was caught is that a test failed AFTER the restore. Run these
+checks with ``PYTHONDONTWRITEBYTECODE=1``, and treat a surprising zero as a question
+rather than an answer.
+
 WHAT IT CANNOT PROVE, and the reason ``test_transport.py`` is structural as well:
 there is no CloudFront here. This stub accepts a POST with no
 ``x-amz-content-sha256`` because nothing is signing anything. Production would
@@ -16,6 +26,8 @@ refuse it at the edge. No functional test in this repository can close that gap.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import threading
 from collections.abc import Iterator
@@ -55,6 +67,22 @@ class Scripted:
     status: int
     body: bytes
     headers: dict[str, str] = field(default_factory=dict)
+
+
+def _write_token(share_id: str) -> str:
+    """The shape the SERVICE mints — ``newWriteToken()`` in app/src/ids.ts.
+
+    THIS LINE WAS THE BUG. It used to be ``f"wt-{share_id}"``, and the library grew a
+    check that a credential header starts with ``sikkerfil_sk_`` or ``wt_``. Every
+    test here passed. Every real caller would have had revoke() and audit() raise on
+    the first call, because the service minted 43 characters of base64url and no
+    prefix at all. A double that invents its own shapes tests the double, and this
+    one agreed with the documentation instead of with the code.
+
+    Derived from the id rather than random so a recorded request stays reproducible.
+    """
+    random_part = base64.urlsafe_b64encode(hashlib.sha256(share_id.encode()).digest())
+    return "wt_" + random_part.decode().rstrip("=")
 
 
 class StubService:
@@ -194,7 +222,7 @@ class StubService:
         share = {
             "id": share_id,
             "state": "pending",
-            "writeToken": f"wt-{share_id}",
+            "writeToken": _write_token(share_id),
             "sizeBytes": body["sizeBytes"],
             "contentType": body.get("contentType", "application/octet-stream"),
             "encryptedName": body.get("encryptedName"),
