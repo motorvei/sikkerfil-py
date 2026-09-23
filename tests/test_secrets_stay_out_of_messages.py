@@ -1727,3 +1727,236 @@ def test_a_path_with_many_components_is_answered_promptly() -> None:
     assert path_carries_key_material("/tmp/" + raw.hex("/"))
     assert path_carries_key_material("/tmp/" + raw.hex("/", 3))
     assert not path_carries_key_material("/home/me/Downloads/kvartalsrapport-2026-q3.pdf")
+
+
+# --- Round twenty-three: presentation is not decided before the alphabet is -------
+
+
+def test_whitespace_can_be_part_of_the_alphabet() -> None:
+    """``altchars`` MAY CONTAIN WHITESPACE, and compacting first destroys it.
+
+    ``b64encode(b"\\xff" * 32, altchars=b"! ")`` is forty-two spaces, an "8" and a
+    "=". It round-trips under the same altchars. Taking the whitespace out — which
+    every rendering check did first, because the decoder tolerates a wrapped key —
+    leaves ``"8="``, so nothing saw it and ``send(password=…)`` posted a recoverable
+    key to the service.
+
+    The fix is not another alphabet: it is asking every spelling ``_spellings``
+    produces rather than one, so the spellings that still have their whitespace get
+    asked too.
+    """
+    import base64
+
+    from sikkerfil.links import opaque_carries_key_material, quoted, renders_key_bytes
+
+    for altchars in (b"! ", b" !", b"\t ", b" \t", b"~ ", b" ~"):
+        for payload in (b"\xff" * 32, b"?" * 32, bytes(range(200, 232))):
+            spelling = base64.b64encode(payload, altchars=altchars).decode()
+            assert base64.b64decode(spelling, altchars=altchars) == payload, altchars
+            assert renders_key_bytes(spelling), (altchars, spelling)
+            assert opaque_carries_key_material(spelling), (altchars, spelling)
+            assert "not repeated" in quoted(spelling), (altchars, spelling)
+
+    # Through the call site: this is a value that reaches the service verbatim.
+    client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9")
+    attempted: list[str] = []
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempted.append(str(request.data))
+        raise urllib.error.URLError("the test does not use the network")
+
+    spelling = base64.b64encode(b"\xff" * 32, altchars=b"! ").decode()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.request, "urlopen", spy)
+        with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+            client.send(b"hello", password=spelling)
+        with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+            client.send(b"hello", name=spelling)
+    assert not attempted, attempted
+
+
+def test_a_rendering_transcribed_to_fullwidth_is_still_a_rendering() -> None:
+    """NFKC IS PART OF THE QUESTION, and only the run test was asking it.
+
+    ``_spellings`` has compatibility-normalised since the fullwidth round, and
+    ``carries_key_material`` reads all four spellings — but ``renders_key_bytes`` read
+    the value once, as written. So ``a85encode(raw_key)`` with every character
+    transcribed to its fullwidth form was invisible twice over: no base64url run for
+    the run test to find in the normalised text, and no rendering check on the
+    normalised text at all.
+    """
+    import base64
+    import unicodedata
+
+    from sikkerfil.links import opaque_carries_key_material, renders_key_bytes
+
+    def fullwidth(text: str) -> str:
+        return "".join(
+            chr(ord(c) - 0x21 + 0xFF01) if 0x21 <= ord(c) <= 0x7E else c for c in text
+        )
+
+    raw = bytes(range(32))
+    for spelling in (
+        base64.a85encode(raw).decode(),
+        base64.b85encode(raw).decode(),
+        base64.b64encode(raw).decode(),
+        base64.urlsafe_b64encode(raw).decode().rstrip("="),
+        raw.hex(),
+        base64.b32encode(raw).decode(),
+    ):
+        wide = fullwidth(spelling)
+        assert wide != spelling, spelling
+        assert unicodedata.normalize("NFKC", wide) == spelling, spelling
+        assert renders_key_bytes(wide), spelling[:24]
+        assert opaque_carries_key_material(wide), spelling[:24]
+
+
+def test_a_content_type_parameter_value_gets_the_whole_question() -> None:
+    """A PARAMETER VALUE IS NOT A REGISTERED TOKEN, so the length tests belong on it.
+
+    The degenerate renderings came out of ``_a_key_hides_in`` because a media type's
+    length is nobody's choice — ``application/tamp-community-update-confirm`` is 41
+    characters because a registry says so. A parameter's VALUE is the opposite: the
+    caller wrote it. So ``text/plain; key="<b64encode(key, altchars=b"~!")>"`` passed
+    the grammar, handed ``_content_type_tokens`` the exact 44-character rendering, and
+    none of the three narrow checks could see its alphabet.
+    """
+    import base64
+    import mimetypes
+
+    from sikkerfil.client import _is_a_content_type
+
+    raw = bytes(range(32))
+    for rendering in (
+        base64.b64encode(b"?" * 32, altchars=b"~!").decode(),
+        base64.b64encode(raw).decode(),
+        base64.b85encode(raw).decode(),
+        base64.a85encode(raw).decode(),
+        raw.hex(),
+        base64.b32encode(raw).decode(),
+        crypto.b64url_encode(raw),
+    ):
+        for shape in (
+            f'text/plain; key="{rendering}"',
+            f'text/plain; charset=utf-8; k="{rendering}"',
+        ):
+            assert not _is_a_content_type(shape), rendering[:24]
+
+    # And every parameter a real caller writes still goes.
+    for ordinary in (
+        "text/plain; charset=utf-8",
+        'text/csv; charset="utf-8"',
+        "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWx",
+        'application/octet-stream; name="kvartalsrapport-2026-q3.pdf"',
+    ):
+        assert _is_a_content_type(ordinary), ordinary
+    for suffix in (".cii", ".pdf", ".xlsx", ".docx", ".csv", ".odt", ".zip", ".json", ".bin"):
+        guessed = mimetypes.guess_type("x" + suffix)[0] or "application/octet-stream"
+        assert _is_a_content_type(guessed), guessed
+
+
+def test_a_parameter_cannot_shelter_a_key_split_across_type_and_subtype() -> None:
+    """THE JOIN IS OF THE HEAD, and appending any parameter defeated it.
+
+    ``<key[:20]>/<key[20:]>`` is caught because deleting the slash gives back the key.
+    Add ``; charset=utf-8`` and the slash-deleted COMPLETE value carries the parameter
+    text too, so it is no longer exactly a key — and the tokeniser then reads the two
+    halves separately and finds neither long enough to be anything.
+    """
+    from sikkerfil.client import _is_a_content_type
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    for cut in (20, 10, 21, 30, 42, 1):
+        head = f"{key[:cut]}/{key[cut:]}"
+        assert not _is_a_content_type(head), head
+        for parameter in ("; charset=utf-8", '; k="v"', "; a=b; c=d", ";\tcharset=utf-8"):
+            assert not _is_a_content_type(head + parameter), head + parameter
+
+
+def test_an_ordinary_passphrase_is_not_a_key() -> None:
+    """A PASSPHRASE IS NOT A RUN, and folding its spaces away made it one.
+
+    ``opaque_carries_key_material`` asked the run test of all four spellings, two of
+    which have the whitespace removed — so "the quick brown fox jumps over the lazy
+    dog" folded to thirty-five characters of base64url alphabet and was refused as a
+    password. Measured on 20,000 phrases of three to eight ordinary words: **58% were
+    refused**, and the refusal told the caller that what is refused is "32 or more
+    characters of base64url in a row, which no password anybody chose looks like",
+    which was not what had happened to them. That is the same shape as breaking every
+    self-hosted deployment — an over-refusal costs everybody, a leak needs a mistake
+    first — and it made the message untrue as well.
+
+    The run test now reads the value as written and its NFKC form, not the compacted
+    ones. Nothing that was held by the fold is lost, because every case the fold
+    existed for is a case whose whitespace-free form is EXACTLY a key, and
+    renders_key_bytes asks that of every spelling. The single exception is asserted
+    below as a gap rather than left to be discovered.
+    """
+    import base64
+
+    from sikkerfil.client import _nothing_here_is_a_key
+
+    for passphrase in (
+        "min hemmelige passordfrase for kvartalsrapporten 2026",
+        "correct horse battery staple",
+        "this is my very secret passphrase",
+        "internal malformed decrypt alongside",
+        "the quick brown fox jumps over the lazy dogs",
+        "correct horse battery staple and one more word",
+        "hunter2",
+        "Sommer2026!",
+        "hemmelig-passord-2026",
+    ):
+        _nothing_here_is_a_key(password=passphrase)
+
+    # WHAT IS STILL REFUSED, MEASURED AND NAMED rather than left for somebody to hit.
+    # On 20,000 phrases of three to eight ordinary words the refusal rate is 9.9%,
+    # down from 58%, and every one of the remainder is a phrase whose LETTERS number
+    # 40, 41 or 43 — the lengths at which base85, z85 (which decodes both 40 and 41)
+    # and base64 render 32 bytes. "the quick brown fox jumps over the lazy dog" is 43
+    # characters, so it is one of them. That cost is the degenerate length tests
+    # meeting the whitespace fold inside renders_key_bytes, which is a separate
+    # decision from this one and is not taken here.
+    for still_refused, letters in (
+        ("the quick brown fox jumps over the lazy dog", 35),  # 43 characters
+        ("a b c d e f g h i j k l m n o p q r s t u v", 22),  # 43 characters
+        ("riktig hest batteri stift og litt mer tekst", 36),  # 43 characters
+        ("dette er en lang passordfrase med mange ord i den", 40),  # 40 LETTERS: base85
+    ):
+        assert len("".join(still_refused.split())) == letters
+        assert len(still_refused) == 43 or letters in (40, 41, 43), still_refused
+        with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+            _nothing_here_is_a_key(password=still_refused)
+
+    # AND EVERY WAY A REAL KEY REACHES THAT SLOT IS STILL CAUGHT. This is the half of
+    # the change that matters: the fold was load-bearing for the spaced spellings, and
+    # what carries them now is the exact rendering test over every spelling.
+    key = crypto.b64url_encode(bytes(range(32)))
+    for label, value in (
+        ("the key itself", key),
+        ("a space between every character", " ".join(key)),
+        ("wrapped by an email client", key[:20] + "\n" + key[20:]),
+        ("wrapped at 10", "\n".join(key[i : i + 10] for i in range(0, len(key), 10))),
+        ("decorated in front", f"user:{key}"),
+        ("decorated behind", f"{key}-old"),
+        ("standard base64", base64.b64encode(bytes(range(32))).decode()),
+        ("hex", bytes(range(32)).hex()),
+        ("base85", base64.b85encode(bytes(range(32))).decode()),
+        ("fullwidth", "".join(chr(ord(c) - 0x21 + 0xFF01) for c in key)),
+    ):
+        with pytest.raises(ConfigurationError, match="looks like a decryption key"):
+            _nothing_here_is_a_key(password=value)
+        assert label
+
+    # THE ONE CASE THE FOLD HELD AND NOTHING ELSE DOES, asserted as a gap so that it
+    # is a decision rather than a discovery: a PARTIAL key with whitespace pushed into
+    # it. Thirty-three of a key's forty-three characters, spaced out, is not exactly a
+    # key in any spelling and has no run of 32 as written.
+    _nothing_here_is_a_key(password=" ".join(key[:33]))
+
+    # The echo path is unchanged and still folds, because printing a spaced-out key
+    # hands it over whatever its shape — the reader deletes the spaces.
+    from sikkerfil.links import carries_key_material, quoted
+
+    assert carries_key_material(" ".join(key))
+    assert "not repeated" in quoted(" ".join(key[:33]))

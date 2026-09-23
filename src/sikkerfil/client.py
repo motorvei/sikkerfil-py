@@ -590,7 +590,25 @@ def _is_a_content_type(value: str) -> bool:
     # characters happen to decode as base85, while leaving content_type out sent the
     # identical value. Every degenerate rendering is a length test; an artificial
     # string is exactly where a length test should not be asked.
-    if links.spells_a_key_exactly(value.replace("/", "")):
+    #
+    # OF THE HEAD, NOT THE WHOLE VALUE, and a parameter was all it took to defeat the
+    # other spelling. "<key[:20]>/<key[20:]>; charset=utf-8" is a valid media type;
+    # deleting the slashes from the COMPLETE value leaves the parameter text attached,
+    # so the join is no longer exactly a key, and the tokeniser then reads the two
+    # halves separately and finds neither long enough. The join only ever meant
+    # anything about the type and subtype, so that is what it is taken of.
+    head = _split_on_unquoted_semicolons(value)[0].strip()
+    if links.spells_a_key_exactly(head.replace("/", "")):
+        return False
+    # A PARAMETER VALUE IS NOT A REGISTERED TOKEN, so it gets the WIDE question. The
+    # reason the degenerate renderings had to come out of _a_key_hides_in is that a
+    # media type's length is nobody's choice — application/tamp-community-update-
+    # confirm is 41 characters because a registry says so, and a length test has
+    # nothing to say about it. A parameter's VALUE is the opposite: the caller wrote
+    # it, it is as free as a password, and a refusal is explainable. So
+    # 'text/plain; key="<b64encode(key, altchars=b"~!")>"' is caught here, where the
+    # narrow checks could not see its alphabet.
+    if any(links.renders_key_bytes(given) for _, given in _content_type_parameters(value)):
         return False
     # EVERY TOKEN, not the whole string and one join. "text/<a key>" and
     # "text/plain; <a key>=x" are both valid media types whose surrounding text makes
@@ -633,17 +651,30 @@ def _content_type_tokens(value: str) -> list[str]:
     backslashes out and the grammar lets them in: ``k="<key with a backslash before
     every tenth character>"`` passed every check while unescaping to the key.
     """
-    head, *parameters = _split_on_unquoted_semicolons(value)
+    head, *_ = _split_on_unquoted_semicolons(value)
     kind, _, subtype = head.strip().partition("/")
     tokens = [head.strip(), kind, subtype]
+    for name, given in _content_type_parameters(value):
+        tokens.extend((name, given))
+    return [token for token in tokens if token]
+
+
+def _content_type_parameters(value: str) -> list[tuple[str, str]]:
+    """Each parameter as (name, value), with the quoted-pairs undone.
+
+    Split out from _content_type_tokens because the two halves of a parameter are not
+    asked the same question any more: a NAME is a token like a subtype, and a VALUE is
+    free text the caller wrote. Parsing it twice is how they would drift apart.
+    """
+    _, *parameters = _split_on_unquoted_semicolons(value)
+    pairs: list[tuple[str, str]] = []
     for parameter in parameters:
         name, _, given = parameter.partition("=")
-        tokens.append(name.strip())
         given = given.strip()
         if given.startswith('"') and given.endswith('"') and len(given) >= 2:
             given = _QUOTED_PAIR.sub(r"\1", given[1:-1])
-        tokens.append(given)
-    return [token for token in tokens if token]
+        pairs.append((name.strip(), given))
+    return pairs
 
 
 def _split_on_unquoted_semicolons(value: str) -> list[str]:

@@ -382,8 +382,30 @@ def renders_key_bytes(value: str) -> bool:
     It is still a closed set and it can still be wrong, but it is closed around
     something real — what a 32-byte key looks like when it is written down — rather
     than around the spellings I happened to think of.
+
+    ASKED OF EVERY SPELLING, NOT ONLY THE ONE AS WRITTEN, and that is two findings in
+    one line. This used to take the whitespace out and test the result, once:
+
+    * ``_spellings`` also compatibility-normalises, and the run check has used it
+      since the fullwidth transcription round — but the rendering check did not, so
+      ``a85encode(raw_key)`` transcribed to fullwidth forms was invisible: NFKC turns
+      it back into the exact Ascii85 rendering, and there is no base64url run in the
+      normalised text for the run check to find either.
+    * and taking the whitespace out DESTROYS A RENDERING, because ``altchars`` may
+      contain whitespace. ``b64encode(b"\xff" * 32, altchars=b"! ")`` is forty-two
+      spaces, an "8" and a "=", it round-trips under the same altchars, and compacting
+      it leaves "8=".
+
+    Both are the same mistake: deciding what is presentation before knowing what the
+    alphabet is. So every spelling _spellings produces is asked — as written, with the
+    whitespace out, normalised, and both — and the whitespace-bearing ones are asked
+    FIRST in the sense that they are asked at all.
     """
-    compact = "".join(value.split())
+    return any(_is_a_rendering_of_a_key(spelling) for spelling in _spellings(value))
+
+
+def _is_a_rendering_of_a_key(compact: str) -> bool:
+    """One spelling, taken exactly as it stands. See :func:`renders_key_bytes`."""
     if not compact:
         return False
 
@@ -402,7 +424,7 @@ def renders_key_bytes(value: str) -> bool:
     if _is_base32_of_a_key(compact):
         return True
 
-    if _is_a_bytes_literal_of_a_key(value):
+    if _is_a_bytes_literal_of_a_key(compact):
         return True
 
     # BASE85, BOTH OF THE STANDARD LIBRARY'S. a85encode and b85encode turn 32 bytes
@@ -969,9 +991,18 @@ def scrubbed(text: str, given: Sequence[str] = ()) -> str:
     #
     # Both spellings, because %r is how argparse formats a value and a value with a
     # newline in it appears escaped rather than literal.
+    #
+    # THE GATE HERE ASKS THE ECHO QUESTION, NOT THE VALUE ONE, and using the wrong one
+    # cost 42 of a key's 43 characters. opaque_carries_key_material stopped folding
+    # whitespace before counting a run — correctly, because a passphrase is not a run
+    # — and this gate was borrowing it, so `sikkerfil <42 key characters separated by
+    # spaces>` became a value we "did not recognise" and argparse's message printed
+    # every one of them. What is being decided here is whether printing this value
+    # hands over a key, which is _safe_to_echo's question and the same one quoted()
+    # asks; that one still reads every spelling, because the reader deletes the spaces.
     cleaned = text
     for value in given:
-        if not value or not opaque_carries_key_material(value):
+        if not value or _safe_to_echo(value):
             continue
         placeholder = f"<{len(value)} characters, not repeated>"
         for spelling in (repr(value), value):
@@ -1165,6 +1196,35 @@ def _spellings(value: str) -> tuple[str, ...]:
     return (value, "".join(value.split()), folded, "".join(folded.split()))
 
 
+def _spellings_with_their_whitespace(value: str) -> tuple[str, ...]:
+    """The same spellings, MINUS the two with the whitespace taken out.
+
+    FOR THE RUN TEST, AND ONLY THERE, because folding the whitespace before counting
+    a run turns a passphrase into one. "the quick brown fox jumps over the lazy dog"
+    folds to thirty-five characters of base64url alphabet and was refused as a
+    password — and the refusal told the caller that what is refused is "32 or more
+    characters of base64url in a row, which no password anybody chose looks like",
+    which was not what had happened to them. Measured on 20,000 phrases of three to
+    eight ordinary words, 58% were refused. That is the same mistake as breaking every
+    self-hosted deployment: an over-refusal costs everybody, while a leak needs a
+    caller mistake first.
+
+    NOTHING IS LOST THAT WAS HELD BY A RUN, and that is why this is safe rather than
+    merely kinder. Every case the fold was there for — ``" ".join(key)``, a key
+    wrapped across two lines by an email client, a key with a newline in the middle —
+    is a case whose whitespace-free form is EXACTLY a key, and renders_key_bytes asks
+    that of every spelling _spellings produces, this one included. What the fold
+    additionally caught was a PARTIAL key with whitespace inserted into it — 33 of a
+    key's 43 characters, spaced out — and that single case is the price.
+
+    The echo path keeps the fold: carries_key_material, which is what quoted() asks
+    before printing a value, still reads every spelling. Printing a spaced-out key
+    hands it over whatever its shape, because the reader deletes the spaces.
+    """
+    folded = unicodedata.normalize("NFKC", value)
+    return (value, folded)
+
+
 def _aliased(value: str) -> str:
     """The same characters, read as base64url rather than standard base64.
 
@@ -1193,7 +1253,7 @@ def opaque_carries_key_material(value: str) -> bool:
         return True
     return any(
         _PATH_CHARACTERS.search(spelling) or _PATH_CHARACTERS.search(_aliased(spelling))
-        for spelling in _spellings(value)
+        for spelling in _spellings_with_their_whitespace(value)
     )
 
 
