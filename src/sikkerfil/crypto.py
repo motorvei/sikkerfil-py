@@ -65,13 +65,24 @@ def b64url_encode(raw: bytes) -> str:
 
 
 def b64url_decode(text: str) -> bytes:
-    """The inverse, tolerating padding whether or not it is there.
+    """The inverse, tolerating padding and whitespace whether or not they are there.
 
     Anything that hands a key back to us — a URL bar, a config file, a shell
-    variable somebody quoted — may or may not have kept the padding. Refusing a
-    correct key over a presentational detail is not a security property.
+    variable somebody quoted, an email that wrapped the line — may or may not have
+    kept the padding, and may have picked up whitespace. Refusing a correct key
+    over a presentational detail is not a security property.
+
+    WHITESPACE GOES BEFORE THE PADDING IS COUNTED, and that order is the whole
+    point. base64 decoding DISCARDS whitespace but the padding calculation COUNTS
+    it, so without this a key with ONE internal space was refused while the same
+    key with TWO was accepted — a coin flip on how much whitespace came along.
+
+    It cannot turn an invalid value into a valid key: 32 bytes needs 43 base64
+    characters, so a key with a character genuinely missing is still short, and
+    every caller that wants a key checks the length.
     """
-    padded = text + "=" * (-len(text) % 4)
+    compact = "".join(text.split())
+    padded = compact + "=" * (-len(compact) % 4)
     return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
@@ -101,19 +112,11 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
     if isinstance(key, (bytes, bytearray, memoryview)):
         raw = bytes(key)
     else:
-        # ALL WHITESPACE GOES, not just the ends, and this is not cosmetic.
-        # base64 decoding DISCARDS whitespace but COUNTS it when checking
-        # padding, so whether a stray character broke a key came down to how
-        # many of them there were, modulo four. With .strip() alone, a key
-        # WRAPPED ACROSS TWO LINES — an ordinary thing in a config file or an
-        # email — was refused, while one with a space every fourth character was
-        # accepted. Same key, same code.
-        #
-        # This cannot turn an invalid value into a valid one: 32 bytes needs 43
-        # base64 characters, so a key with a character missing is still short and
-        # the length check below still refuses it. Verified, not assumed.
+        # Whitespace and padding are b64url_decode's problem, for every caller
+        # and not just this one — a key pasted into it directly had the same
+        # modulo-four coin flip this function was fixed for.
         try:
-            raw = b64url_decode("".join(key.split()))
+            raw = b64url_decode(key)
         # Both spellings of "not base64url" land here: binascii.Error for bad
         # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
         except (TypeError, ValueError):

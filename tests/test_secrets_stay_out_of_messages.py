@@ -63,6 +63,11 @@ def _broken_things_holding_a_real_key() -> list[tuple[str, Callable[[], object]]
         # exactly how the leak it was written to catch stayed in.
         ("parse_link: the bare key", lambda: parse_link(SECRET)),
         ("parse_link: the key as a path", lambda: parse_link(f"https://sikkerfil.no/{SECRET}")),
+        # '?' WHERE '#' BELONGS. No slash before the query, so splitting the URL
+        # on '/' took the key to be part of the host. urlsplit knows better.
+        ("parse_link: ? instead of #", lambda: parse_link(f"https://sikkerfil.no?k={SECRET}")),
+        ("parse_link: query and fragment", lambda: parse_link(f"https://sikkerfil.no/x?k={SECRET}#k={SECRET}")),
+        ("parse_link: a bad IPv6 authority", lambda: parse_link(f"https://[oops/x#k={SECRET}")),
         ("parse_link: the key with a newline", lambda: parse_link(SECRET + "\n")),
         ("receive: the bare key", lambda: receive(SECRET)),
         # One character lost or mangled on the way through a mail client.
@@ -116,3 +121,29 @@ def test_the_guard_can_actually_see_a_leak() -> None:
     # And it must not fire on the redacted forms, or it would be useless noise.
     assert not _leaks("https://sikkerfil.no/<unrecognised> does not look like a share link")
     assert not _leaks("a 43-character value that is not repeated here, in case it is a key")
+
+
+def test_the_redaction_does_not_echo_userinfo_either() -> None:
+    """A password in the authority is a credential in an error message.
+
+    Not one Codex named — found by asking what ELSE a URL can carry that we would
+    not want in a log, once splitting on '/' turned out to be the wrong tool.
+    netloc keeps ``user:password@``; hostname does not, which is why redaction
+    uses the parsed hostname rather than the raw authority.
+    """
+    from sikkerfil.links import redacted
+
+    out = redacted(f"https://user:hunter2@sikkerfil.no/Deep/Path#k={SECRET}")
+    assert "hunter2" not in out, out
+    assert "user" not in out, out
+    assert out == "https://sikkerfil.no/<unrecognised>"
+
+
+def test_the_redaction_keeps_what_a_caller_needs() -> None:
+    # Safe is not enough — if it redacted everything it would be useless, and the
+    # next person would go back to printing the link. The market a caller aimed at
+    # is the useful part, and a port matters for a stub or a self-hosted origin.
+    from sikkerfil.links import redacted
+
+    assert redacted(f"https://sikkerfil.dk/A/B#k={SECRET}") == "https://sikkerfil.dk/<unrecognised>"
+    assert redacted("http://127.0.0.1:54321/A/B") == "http://127.0.0.1:54321/<unrecognised>"

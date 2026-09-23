@@ -87,7 +87,19 @@ def parse_link(link: str) -> ParsedLink:
             f"link is {SHARE_NAME.pattern}"
         )
 
-    parts = urlsplit(text)
+    # urlsplit RAISES on a malformed authority — "https://[oops/x" gives
+    # ValueError("Invalid IPv6 URL"). Letting that out breaks this function's one
+    # promise, which is that something it will not accept comes back as a
+    # ConfigurationError; a caller catching SikkerfilError would miss it entirely.
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        raise ConfigurationError(
+            "that address could not be parsed as a URL. Expected "
+            "https://sikkerfil.no/s/<id>#k=<key>. It is not repeated here, in "
+            "case any part of it is a key."
+        ) from None
+
     if parts.scheme not in ("https", "http"):
         raise ConfigurationError(f"a share link must be https; got {parts.scheme!r}")
     origin = f"{parts.scheme}://{parts.netloc}"
@@ -174,10 +186,21 @@ def redacted(link: str) -> str:
     sender who kept the id and the key separately and pasted the wrong one.
     Stripping only the fragment left that case fully exposed.
     """
-    scheme, separator, rest = link.partition("#")[0].partition("://")
-    if not separator:
+    # PARSED, NOT SPLIT ON '/'. Splitting kept everything up to the first slash,
+    # so a link using '?' instead of '#' — https://sikkerfil.no?k=<key>, an easy
+    # near miss — had no slash at all and the whole key came through as the
+    # "host". urlsplit knows where the authority ends.
+    #
+    # hostname rather than netloc, because netloc carries userinfo:
+    # https://user:hunter2@host/… would otherwise put the password in the message.
+    try:
+        parts = urlsplit(link)
+        host, port = parts.hostname, parts.port
+    except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
         return "<unrecognised>"
-    return f"{scheme}://{rest.partition('/')[0]}/<unrecognised>"
+    if not parts.scheme or not host:
+        return "<unrecognised>"
+    return f"{parts.scheme}://{host}{f':{port}' if port else ''}/<unrecognised>"
 
 
 def _describe(value: str) -> str:
