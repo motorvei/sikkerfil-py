@@ -20,6 +20,9 @@ crypto.key_text, and one in parse_link that predates it.
 from __future__ import annotations
 
 import contextlib
+import io
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from typing import Any
 
@@ -815,16 +818,219 @@ def test_a_key_as_base_url_is_refused_at_construction() -> None:
             Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=retained, retries=0)
         assert not _leaks(str(caught.value)), str(caught.value)
 
-    # And a reverse-proxy path prefix still works, since origin_of's answer is used
-    # as a verdict and not as the value. An IPv6 literal too, which a previous version
-    # of this area broke.
-    client = Sikkerfil(
-        api_key="sikkerfil_sk_" + "x" * 43, base_url="https://host.example/sikkerfil", retries=0
-    )
-    assert client.base_url == "https://host.example/sikkerfil"
-    assert (
+    # A DELIMITER WITH NOTHING AFTER IT IS STILL A DELIMITER. "https://host?" parses
+    # with an empty query, so a truthiness test accepted it — and the caller's string
+    # is what gets kept, so the next request asked for "https://host?/api/v1/health"
+    # and the API path became a query aimed at the host root.
+    for delimiter in (
+        "https://host.example?",
+        "https://host.example#",
+        "https://host.example?#",
+    ):
+        with pytest.raises(ConfigurationError):
+            Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=delimiter, retries=0)
+
+    # A KEY PERCENT-ENCODED INTO THE PATH, which breaks every run while urllib hands
+    # the server all 43 characters back. The same bypass as the hostname one, in the
+    # component the hostname fix did not cover.
+    lowercase = crypto.key_text("a" * 42 + "g")
+    encoded = "".join(f"%{ord(c):02X}" if i % 11 == 10 else c for i, c in enumerate(lowercase))
+    with pytest.raises(ConfigurationError):
         Sikkerfil(
-            api_key="sikkerfil_sk_" + "x" * 43, base_url="http://[::1]:5000", retries=0
-        ).base_url
-        == "http://[::1]:5000"
-    )
+            api_key="sikkerfil_sk_" + "x" * 43,
+            base_url=f"https://host.example/{encoded}",
+            retries=0,
+        )
+
+    # AND A PATH PREFIX IS REFUSED, which is a feature I added last round and have
+    # now taken back out. It was accepted for reverse-proxy deployments and produced
+    # a base URL that cannot work: send() hands base_url to build_link, origin_of
+    # drops the path, and the recipient gets https://host.example/s/<id> — the wrong
+    # route — while parse_link cannot read a prefixed link at all, so receive() would
+    # refuse this library's own output. Supporting a prefix means teaching build_link
+    # and parse_link about it, which is a feature rather than a fix.
+    with pytest.raises(ConfigurationError):
+        Sikkerfil(
+            api_key="sikkerfil_sk_" + "x" * 43,
+            base_url="https://host.example/sikkerfil",
+            retries=0,
+        )
+
+    # An IPv6 literal and a bare origin still work, which a previous version of this
+    # area broke twice.
+    for good in (
+        "http://[::1]:5000",
+        "https://my-company-files.example.com",
+        "https://host.example/",
+    ):
+        client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, base_url=good, retries=0)
+        assert client.base_url == good.rstrip("/")
+
+
+# --- Round thirteen: the separator, the alphabet, and the case of a header ----
+
+
+def test_a_decorated_key_split_across_components_is_caught() -> None:
+    """FOUR CHARACTERS DEFEATED THE PREVIOUS FIX.
+
+    Testing whether the join of two components was EXACTLY a key read as precise:
+    ``<key[:21]>.<key[21:]>-old`` joins to 47 characters that are not a key and
+    contain one, so the host was accepted and DNS got every character. Every
+    key-sized window of the join is tested now.
+    """
+    from sikkerfil.links import origin_of, path_carries_key_material, redacted_path
+
+    lowercase = crypto.key_text("a" * 42 + "g")
+    for decoration in ("-old", "_v2", "2026"):
+        host = f"{lowercase[:21]}.{lowercase[21:]}{decoration}"
+        assert origin_of(f"https://{host}/x") == "", host
+        path = f"/a/{lowercase[:21]}/{lowercase[21:]}{decoration}"
+        assert path_carries_key_material(path), path
+        assert not _leaks(redacted_path(path))
+
+    # AND THE COMPONENT THAT COULD HOLD A WHOLE KEY ALONE DOES NOT IMPLICATE ITS
+    # NEIGHBOURS. A window straddling a long directory name and a key-named file is
+    # 43 characters of the alphabet like any other, so marking the whole run withheld
+    # this suite's own tmp_path — the thing the message exists to show.
+    keyed = f"/tmp/pytest-of-user/pytest-180/test_a_key_shaped_filename_is_0/{SECRET}"
+    assert redacted_path(keyed).startswith("/tmp/pytest-of-user/pytest-180/test_a_key")
+    assert not _leaks(redacted_path(keyed))
+
+    # And an ordinary deep path, which a window scan with no other condition eats:
+    # "homemeDocumentswork2026rapporterkvartalq3final" is 45 characters of perfectly
+    # good base64url alphabet.
+    ordinary = "/home/me/Documents/work/2026/rapporter/kvartal/q3/final"
+    assert not path_carries_key_material(ordinary)
+    assert redacted_path(ordinary) == ordinary
+
+
+def test_a_key_split_with_backslashes_is_caught_too() -> None:
+    """Windows separators. The same disclosure with a different key on the keyboard.
+
+    Splitting on "/" alone made ``C:\\Users\\me\\<half>\\<half>`` a single component
+    with no long run in it, so both halves printed in full — and ReceivedFile.save
+    would have written the file.
+    """
+    from sikkerfil.links import path_carries_key_material, redacted_path
+
+    windows = f"C:\\Users\\me\\{SECRET[:21]}\\{SECRET[21:]}"
+    assert path_carries_key_material(windows)
+    assert not _leaks(redacted_path(windows))
+    # The separators survive redaction, or the message names a path nobody has.
+    assert redacted_path(windows).startswith("C:\\Users\\me\\")
+    ordinary = "C:\\Users\\me\\Documents\\kvartal-2026-q3.xlsx"
+    assert redacted_path(ordinary) == ordinary
+
+
+def test_standard_base64_spelling_is_refused_where_it_would_be_sent() -> None:
+    """REFUSING IT AS INPUT SAID NOTHING ABOUT PRINTING IT.
+
+    ``("A" * 10 + "/") * 3 + "A" * 10`` is 43 characters that become a working key
+    the moment somebody swaps the slashes for underscores. The decoder rightly
+    refuses that spelling — and the guard on send()'s body parameters used the PATH
+    predicate, which splits on "/", so it read four short components and let the
+    whole thing through to the service.
+    """
+    from sikkerfil.links import opaque_carries_key_material
+
+    alias = ("A" * 10 + "/") * 3 + "A" * 10
+    assert len(alias) == 43
+    assert opaque_carries_key_material(alias)
+    assert opaque_carries_key_material(alias.replace("/", "+"))
+    # And the values these guards must not refuse.
+    for ordinary in (
+        "application/octet-stream",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "kvartalsrapport-2026-q3",
+        "hemmelig-passord-2026",
+        "text/csv",
+    ):
+        assert not opaque_carries_key_material(ordinary), ordinary
+
+
+def test_a_credential_header_is_recognised_whatever_its_case() -> None:
+    """HTTP header names are case-insensitive; a dict lookup is not.
+
+    Nothing in this library spells them any way but through the constants, so the
+    check was never missed here — but Transport is public, "X-Sikkerfil-Token" is the
+    conventional spelling, and the service reads that header just the same.
+    """
+    from sikkerfil.transport import Transport
+
+    attempted: list[str] = []
+
+    def spy(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempted.extend(f"{n}: {v}" for n, v in request.header_items())
+        raise urllib.error.URLError("the test does not use the network")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(urllib.request, "urlopen", spy)
+        spellings = ("X-Sikkerfil-Token", "x-sikkerfil-token", "X-SIKKERFIL-KEY", "X-Sikkerfil-Key")
+        for spelling in spellings:
+            with pytest.raises(ConfigurationError, match="not shaped like a credential"):
+                Transport("http://127.0.0.1:9", retries=0).get_json(
+                    "/api/v1/health", headers={spelling: SECRET}
+                )
+    assert not any(_leaks(line) for line in attempted), attempted
+
+
+def test_a_truncated_key_is_not_a_named_link() -> None:
+    """The service's own pattern says what a name IS, not what it CARRIES.
+
+    ``"a" * 40`` is a valid named link by that regex and the first 40 characters of a
+    real key: 240 of its 256 bits before the '#', with about 65,536 completions left
+    to try offline. Both questions have to be asked.
+    """
+    lowercase = crypto.key_text("a" * 42 + "g")
+    for prefix in (40, 36, 33):
+        with pytest.raises(ConfigurationError) as caught:
+            build_link("https://sikkerfil.no", lowercase[:prefix], SECRET)
+        assert not _leaks(str(caught.value)), str(caught.value)
+    # And the named links that must keep working.
+    for name in ("kvartalsrapport-2026-q3", "rapport", "q3-2026-endelig"):
+        assert build_link("https://sikkerfil.no", name, SECRET).startswith(
+            f"https://sikkerfil.no/{name}#k="
+        )
+
+
+def test_argparse_cannot_echo_a_key_from_any_slot() -> None:
+    """EVERY argparse REFUSAL, not the two options I fixed one at a time.
+
+    ``choices=`` came off --market and ``type=int`` came off --max-downloads, and the
+    SUBCOMMAND slot was still argparse's: ``sikkerfil <a key>`` formats "invalid
+    choice: '<the whole key>'" onto stderr itself, and the SystemExit it then raises
+    carries nothing, so the exception was spotless and the terminal had the key.
+    """
+    from sikkerfil import cli
+
+    wide = "".join(chr(ord(ch) + 0xFEE0) if "!" <= ch <= "~" else ch for ch in SECRET)
+    for argv in (
+        [SECRET],
+        [wide],
+        [" ".join(SECRET)],
+        ["--market", SECRET, "list"],
+        ["send", "rapport.pdf", "--max-downloads", SECRET],
+        ["send", "rapport.pdf", "--expires", SECRET],
+    ):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.suppress(BaseException),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            cli.main(argv)
+        written = out.getvalue() + err.getvalue()
+        assert not _leaks(written), written
+        assert wide not in written, written
+
+    # AND THE ORDINARY MESSAGES STILL SAY SOMETHING. A run test over the
+    # whitespace-folded spelling withheld "the following arguments are required:
+    # file", because that is 32 characters of the alphabet once the spaces come out.
+    err = io.StringIO()
+    with (
+        contextlib.suppress(BaseException),
+        contextlib.redirect_stderr(err),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        cli.main(["send"])
+    assert "required" in err.getvalue() and "file" in err.getvalue(), err.getvalue()

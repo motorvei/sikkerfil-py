@@ -265,6 +265,12 @@ class Sikkerfil:
         The key is used in this process and is never part of any request.
         """
         parsed = parse_link(link)
+        # THE DOWNLOAD HAS A BODY TOO. The three send() parameters were guarded and
+        # this one was not, though it is the more likely mix-up of the two: a
+        # recipient holds a link and a password in the same hand, and
+        # receive(link, password=<the link's own key>) posts the key that opens the
+        # file to the service that stores it, in the same request that asks for it.
+        _nothing_here_is_a_key(password=password)
 
         # CANONICALISE BEFORE COMPARING. A key arrives as base64url text or as the
         # raw bytes crypto hands back, and a fragment may keep its padding or not.
@@ -454,10 +460,10 @@ def _usable_base_url(candidate: str) -> bool:
     gap between "what was validated" and "what is used" was worth watching, and then
     shipped it anyway.
 
-    So: the origin has to be usable, a path may survive (somebody behind a reverse
-    proxy passes https://host/sikkerfil) but only if it carries no key material, and a
-    query, fragment or userinfo is refused outright — none of them belongs in a base
-    URL, and each is another place for a secret to ride along.
+    So: the origin has to be usable, and a path, query, fragment or userinfo is
+    refused — none of them belongs in a base URL, each is another place for a secret
+    to ride along, and a path in particular produced links this library could not
+    itself parse.
     """
     if not origin_of(candidate):
         return False
@@ -465,9 +471,22 @@ def _usable_base_url(candidate: str) -> bool:
         parts = urlsplit(candidate)
     except ValueError:
         return False
-    if parts.query or parts.fragment or "@" in parts.netloc:
+    # THE CHARACTERS, NOT THE PARSED VALUES. "https://host?" has an empty query, so a
+    # truthiness test passed it — and the caller's own string is what gets kept, so
+    # the next request asked for "https://host?/api/v1/health" and the API path
+    # became a query string aimed at the host root.
+    if "?" in candidate or "#" in candidate or "@" in parts.netloc:
         return False
-    return not links.path_carries_key_material(parts.path)
+    # AND NO PATH AT ALL. I accepted a path prefix last round for reverse-proxy
+    # deployments, checked it for key material, and shipped a base URL that cannot
+    # work: send() hands base_url to build_link, origin_of drops the path, and the
+    # recipient gets https://host.example/s/<id> — the wrong route. parse_link cannot
+    # read a prefixed link either, so receive() would refuse the library's own
+    # output. A feature that produces broken links is worse than one that is absent,
+    # and build_link and parse_link agreeing about what a link is has already been
+    # the right answer twice on this branch. Supporting a prefix means teaching both
+    # of them, which is a feature and not a fix.
+    return not parts.path.strip("/")
 
 
 def _client_for(link: str, timeout: float, market: str | None = None) -> Sikkerfil:
@@ -524,7 +543,10 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
 
 
 def _nothing_here_is_a_key(
-    *, name: str | None, content_type: str | None, password: str | None
+    *,
+    name: str | None = None,
+    content_type: str | None = None,
+    password: str | None = None,
 ) -> None:
     """The three send() parameters that reach the service AS THEY WERE GIVEN.
 
@@ -538,14 +560,19 @@ def _nothing_here_is_a_key(
     ``filename`` is deliberately not in this list: it is sealed under the file's own
     key before it goes anywhere, so a key pasted there is encrypted, not sent.
 
-    THREE PARAMETERS, TWO THRESHOLDS, for a reason:
+    FOUR SLOTS NOW: receive()'s password is the fourth and the likelier mix-up of the
+    lot, since a recipient holds a link and a password in the same hand.
 
-    * ``name`` becomes a path component of a public link (``sikkerfil.no/<name>``), so
-      it gets the PATH threshold — the one that leaves ``kvartalsrapport-2026-q3``
-      alone. Refusing a name costs the caller the name they wanted; a 32-character
-      base64url run is not a name anybody wanted.
-    * ``content_type`` is ``type/subtype``, and the path predicate splits on the slash
-      exactly as that needs. A 32-character run inside a MIME type is not a MIME type.
+    THE PATH PREDICATE WAS THE WRONG ONE, which is this round's correction. It splits
+    on "/" — right for a path, wrong for a password, because standard base64 spells
+    with "/" and ``("A" * 10 + "/") * 3 + "A" * 10`` is 43 characters that become a
+    working key the moment somebody swaps slashes for underscores. Split on the
+    slashes it reads as four short components and passes. These are opaque values,
+    not paths, so they get opaque_carries_key_material, which folds that alias in.
+
+    * ``name`` becomes a path component of a public link (``sikkerfil.no/<name>``) and
+      ``content_type`` is ``type/subtype``; both take the PATH threshold, the one that
+      leaves ``kvartalsrapport-2026-q3`` and ``application/octet-stream`` alone.
     * ``password`` gets the same threshold, AFTER EXACTNESS WAS TRIED AND WAS WRONG.
       "Only a value that is a key to the character" reads as careful and let
       ``user:<key>`` and ``<key>-old`` through — each carrying all 256 bits to the
@@ -554,20 +581,20 @@ def _nothing_here_is_a_key(
       threshold costs a caller whose password is 32 unbroken base64url characters,
       and that is the right side to err on.
     """
-    if name and links.path_carries_key_material(name):
+    if name and links.opaque_carries_key_material(name):
         raise ConfigurationError(
             "the share name given carries what looks like a decryption key. A name "
             "goes to the service in the clear and becomes part of a public link, so "
             "a key in it is published as well as disclosed. The key belongs after "
             "'#k=' in the link the send returns. The value is not repeated here."
         )
-    if content_type and links.path_carries_key_material(content_type):
+    if content_type and links.opaque_carries_key_material(content_type):
         raise ConfigurationError(
             "the content type given carries what looks like a decryption key. It is "
             "sent to the service as a hint for the recipient, which is the one place "
             "a key must never go. The value is not repeated here."
         )
-    if password and links.path_carries_key_material(password):
+    if password and links.opaque_carries_key_material(password):
         raise ConfigurationError(
             "the password given carries what looks like a decryption key. A password "
             "is sent to the service, which hashes it — so a key used as one is handed "

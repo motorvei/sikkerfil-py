@@ -11,6 +11,7 @@ that must not be in it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any
 
@@ -496,3 +497,65 @@ def test_a_key_in_a_send_parameter_never_reaches_the_body(
         }[slot]
     }
     client.send(PLAINTEXT, **ordinary)
+
+
+def test_a_key_as_the_receive_password_never_reaches_the_download(
+    client: Sikkerfil, stub
+) -> None:
+    """THE LIKELIER OF THE TWO MIX-UPS, and the one the send() guard did not cover.
+
+    A recipient holds a link and a password in the same hand, so
+    ``receive(link, password=<the link's own key>)`` is an ordinary slip — and it
+    posted the key that opens the file to the service that stores it, in the request
+    that asks for it. Only send()'s three parameters were guarded.
+
+    Checked against the stub rather than a dead port, because receive() reads the
+    share's metadata first: pointed at a closed socket it fails on that request and
+    never assembles the download body, which is why this leak did not show up in the
+    sweep's own network-refusing fixture.
+    """
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    before = len(stub.requests)
+    for spelling in (sent.key, f"user:{sent.key}", sent.key + "-old"):
+        with pytest.raises(ConfigurationError) as caught:
+            client.receive(sent.url, password=spelling)
+        assert "decryption key" in str(caught.value)
+        assert sent.key not in str(caught.value)
+    assert len(stub.requests) == before, "a request went out before the refusal"
+
+    # A password that is a password still gets through to the service.
+    with contextlib.suppress(Exception):
+        client.receive(sent.url, password="hemmelig")
+    posted = [r for r in stub.requests[before:] if r.body and b"hemmelig" in r.body]
+    assert posted, "an ordinary password no longer reaches the download"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        ("A" * 10 + "/") * 3 + "A" * 10,  # standard base64's alphabet
+        ("A" * 10 + "+") * 3 + "A" * 10,
+    ],
+)
+def test_a_standard_base64_key_never_reaches_a_request_body(
+    spelling: str, client: Sikkerfil, stub
+) -> None:
+    """THE WIRING, not the predicate.
+
+    ``opaque_carries_key_material`` had a test and the three call sites did not, so
+    swapping them back to the path predicate — which splits on "/" and reads this as
+    four short components — broke nothing at all. The predicate being right is not
+    the property; what send() and receive() actually ask is.
+    """
+    before = len(stub.requests)
+    for slot in ("password", "name", "content_type"):
+        given: dict[str, Any] = {slot: spelling}
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, **given)
+    assert len(stub.requests) == before
+
+    sent = client.send(PLAINTEXT, filename="rapport.pdf")
+    before = len(stub.requests)
+    with pytest.raises(ConfigurationError):
+        client.receive(sent.url, password=spelling)
+    assert len(stub.requests) == before

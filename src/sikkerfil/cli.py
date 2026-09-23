@@ -24,11 +24,12 @@ import os
 import re
 import sys
 from collections.abc import Sequence
+from typing import NoReturn
 
 from . import __version__
 from .client import Sikkerfil, _client_for
 from .errors import ConfigurationError, SikkerfilError
-from .links import DEFAULT_MARKET, MARKETS, quoted
+from .links import DEFAULT_MARKET, MARKETS, quoted, scrubbed
 
 _DURATION = re.compile(r"^(\d+)\s*([smhdw]?)$", re.IGNORECASE)
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "": 1}
@@ -65,8 +66,26 @@ def duration(text: str) -> int:
     return int(match.group(1)) * _UNITS[match.group(2).lower()]
 
 
+class _Parser(argparse.ArgumentParser):
+    """An argparse parser whose own error messages cannot echo a key.
+
+    ``error()`` is the one funnel every argparse refusal goes through — a bad
+    choice, a bad conversion, a missing argument, an unrecognised one — and each of
+    them formats the offending value into the message and writes it to stderr
+    itself. Overriding it covers the ones I have not thought of, which is the point:
+    I fixed this option by option twice and a third slot was still open.
+
+    Subparsers inherit this class, because add_subparsers defaults parser_class to
+    the type of the parser it is called on.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {scrubbed(message)}\n")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="sikkerfil",
         description="Encrypted file transfer that stays inside Scandinavia.",
         epilog="Protocol documentation: https://sikkerfil.no/utviklere",

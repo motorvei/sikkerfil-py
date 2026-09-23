@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
-from .crypto import key_text
+from .crypto import KEY_BYTES, key_text
 from .errors import ConfigurationError
 
 #: The service's own id alphabet — uppercase and digits, 4 to 32 characters.
@@ -193,7 +193,14 @@ def build_link(origin: str, reference: str, key: str | bytes) -> str:
     # exact and already written down, and a key matches NEITHER — 43 characters
     # exceeds the 32 of an id and the 40 of a name, and an id has no lowercase.
     # Precision beats a heuristic when precision is available.
-    if not SHARE_ID.match(reference) and not SHARE_NAME.match(reference):
+    # AND THE PATTERNS ARE NOT SUFFICIENT, which is the correction to the paragraph
+    # above. "a" * 40 is a valid named link by the service's own regex AND the first
+    # 40 characters of a real key — 240 of its 256 bits, before the '#', with about
+    # 65,536 completions left to try offline. Precision beats a heuristic at saying
+    # what a value IS; it says nothing about what a value CARRIES, and both questions
+    # have to be asked here.
+    recognised = SHARE_ID.match(reference) or SHARE_NAME.match(reference)
+    if not recognised or path_carries_key_material(reference):
         raise ConfigurationError(
             f"{describe(reference)}. A link's path is sent to the server, so a key "
             "belongs only after '#k='. A share id is "
@@ -330,18 +337,10 @@ def structured_carries_key(parts: Sequence[str]) -> bool:
     them back together. So the per-part threshold stays, for the ordinary case, and
     every CONTIGUOUS RUN of parts is also joined and tested for being exactly a key.
 
-    Exactly a key, not a run: joining ``my-company-files.example.com`` gives
-    twenty-six base64url characters, which a run test would refuse and which is not
-    a key. Exactness is available here because a key is a fixed size, and a fixed
-    size is the one thing a heuristic never needs to guess at.
+    Exactly a key was not enough, though — see _parts_carrying_key, which does the
+    work for both this and the redaction, so the two cannot answer differently.
     """
-    if any(_run_in(part, _PATH_CHARACTERS) for part in parts):
-        return True
-    for start in range(len(parts)):
-        for end in range(start + 2, len(parts) + 1):
-            if looks_like_a_key("".join(parts[start:end])):
-                return True
-    return False
+    return bool(_parts_carrying_key(parts))
 
 
 def path_carries_key_material(path: str) -> bool:
@@ -353,7 +352,7 @@ def path_carries_key_material(path: str) -> bool:
     used the value threshold here anyway, which cost this suite's own tmp_path a
     second time.
     """
-    return structured_carries_key(path.split("/"))
+    return structured_carries_key(_components(path))
 
 
 def redacted_path(path: str) -> str:
@@ -372,14 +371,30 @@ def redacted_path(path: str) -> str:
     names a directory. The two numbers answer genuinely different questions: for a
     value, refusing costs nothing; for a path, refusing costs the name.
     """
-    parts = path.split("/")
+    pieces = _SEPARATORS.split(path)
+    parts = pieces[::2]
+    separators = pieces[1::2]
     suspect = _parts_carrying_key(parts)
     if not suspect:
         return path
-    return "/".join(
-        f"<{len(part)} characters, not repeated>" if index in suspect else part
-        for index, part in enumerate(parts)
-    )
+    out = []
+    for index, part in enumerate(parts):
+        out.append(f"<{len(part)} characters, not repeated>" if index in suspect else part)
+        if index < len(separators):
+            out.append(separators[index])
+    return "".join(out)
+
+
+#: What separates one component of a path from the next. BACKSLASH TOO, because a
+#: Windows path is the same disclosure with a different key on the keyboard:
+#: "C:\\Users\\me\\<key[:21]>\\<key[21:]>" split on "/" alone is ONE component that
+#: happens to contain no long run, so both halves printed in full.
+_SEPARATORS = re.compile(r"([/\\])")
+
+
+def _components(path: str) -> list[str]:
+    """``path`` as its components, on either separator."""
+    return _SEPARATORS.split(path)[::2]
 
 
 def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
@@ -387,20 +402,127 @@ def _parts_carrying_key(parts: Sequence[str]) -> set[int]:
 
     A KEY SPLIT ACROSS COMPONENTS is carried by none of them on its own:
     ``key[:21] + "/" + key[21:]`` has two parts, both under the threshold, and the
-    message printed every character. So each contiguous run of components is joined
-    and tested for being exactly a key, and every component in a run that matches is
-    marked.
+    message printed every character. So contiguous components are joined and the
+    join is searched for a key.
 
-    ONLY THE PARTICIPANTS, though. Redacting the whole path throws away the half that
-    identifies the mistake — "/home/me/<a key>" should name the directory and withhold
-    the name. My first version hid "home" and "me" too, which is safe and useless.
+    SEARCHED, NOT COMPARED, which is the correction this round. Testing whether the
+    join was EXACTLY a key read as precise and was defeated by four characters:
+    ``<key[:21]>.<key[21:]>-old`` joins to 47 characters that are not a key and
+    contain one, and a host shaped like that sends every character through DNS. So
+    every key-sized window of the join is tested instead.
+
+    AND "IS A KEY" IS A LENGTH TEST, which is worth saying plainly because I have
+    been describing it as something sharper. ANY forty-three characters of base64url
+    decode to exactly thirty-two bytes — 43 = 40 + 3 gives 30 + 2 — so
+    looks_like_a_key asks how long a value is and what alphabet it is in, and nothing
+    else. There is no entropy check to be had; the precision here is the size.
+
+    AND ONLY WHERE THE PIECES ARE BIG ENOUGH TO BE PIECES OF A KEY, which is what
+    keeps this from eating ordinary paths. ``/home/me/Documents/work/2026/rapporter``
+    joins to 45 characters of perfectly good base64url alphabet, and a window scan
+    with no other condition would redact it — the exact over-strictness that broke
+    self-hosted hosts two rounds ago, moved to paths. A component carrying part of a
+    key is at least KEY_RUN characters of the alphabet; "home" and "me" are not, so
+    only runs of components that all clear that bar are joined. The gap is a key
+    split into four pieces of eleven, which is a shape nothing produces by accident;
+    the alternative is a library that cannot print a directory.
+
+    ONLY THE PARTICIPANTS are marked. Redacting the whole path throws away the half
+    that identifies the mistake — "/home/me/<a key>" should name the directory and
+    withhold the name. My first version hid "home" and "me" too: safe and useless.
     """
     suspect = {index for index, part in enumerate(parts) if _run_in(part, _PATH_CHARACTERS)}
-    for start in range(len(parts)):
-        for end in range(start + 2, len(parts) + 1):
-            if looks_like_a_key("".join(parts[start:end])):
-                suspect.update(range(start, end))
+    # A COMPONENT THAT COULD HOLD A WHOLE KEY BY ITSELF IS NOT A FRAGMENT. It is
+    # already marked by the run test above, and letting it into a join implicates its
+    # neighbours: "…/pytest-180/test_a_key_shaped_filename_is_0/<key>" has a 43-
+    # character window straddling the directory and the key, so the directory this
+    # suite needs to print was withheld. Joins exist for the key that no single
+    # component can hold.
+    fragments = [
+        index
+        for index, part in enumerate(parts)
+        if len(part) >= KEY_RUN and _run_in(part, _KEY_CHARACTERS) and not _holds_a_key(part)
+    ]
+    for run in _contiguous(fragments):
+        joined = "".join(parts[index] for index in run)
+        spans, position = [], 0
+        for index in run:
+            spans.append((index, position, position + len(parts[index])))
+            position += len(parts[index])
+        found = False
+        for start in range(len(joined) - KEY_TEXT_LENGTH + 1):
+            if not looks_like_a_key(joined[start : start + KEY_TEXT_LENGTH]):
+                continue
+            found = True
+            # ONLY THE COMPONENTS THE WINDOW ACTUALLY TOUCHES. Marking the whole run
+            # hid this suite's own tmp_path: "pytest-180/test_a_key_shaped_…_is_0"
+            # sits next to a key-named file, so the run matched and the directory the
+            # caller needs to see went with it. A window inside one component
+            # implicates one component.
+            window = range(start, start + KEY_TEXT_LENGTH)
+            suspect |= {
+                index
+                for index, first, last in spans
+                if first < window.stop and last > window.start
+            }
+        if not found and _holds_a_key(joined):
+            # Some other spelling of the join is a key — percent-encoded, folded,
+            # spaced. The offsets do not survive those transformations, so the whole
+            # run is withheld rather than guessed at.
+            suspect.update(run)
     return suspect
+
+
+def _contiguous(indexes: Sequence[int]) -> list[list[int]]:
+    """``[1, 2, 5, 6, 7]`` as ``[[1, 2], [5, 6, 7]]`` — runs of neighbours, two or more."""
+    runs: list[list[int]] = []
+    for index in indexes:
+        if runs and index == runs[-1][-1] + 1:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return [run for run in runs if len(run) > 1]
+
+
+def _holds_a_key(joined: str) -> bool:
+    """Whether any key-sized window of any spelling of ``joined`` is a key."""
+    for spelling in _spellings(joined):
+        for start in range(len(spelling) - KEY_TEXT_LENGTH + 1):
+            if looks_like_a_key(spelling[start : start + KEY_TEXT_LENGTH]):
+                return True
+    return False
+
+
+def scrubbed(text: str) -> str:
+    """A message written by somebody else, with anything key-shaped taken out.
+
+    FOR ARGPARSE, WHICH FORMATS ITS OWN REFUSALS AND WRITES THEM ITSELF. "invalid
+    choice: '<the whole key>'" reaches stderr before any of this library's code runs,
+    and the SystemExit it then raises carries nothing, so the exception was spotless
+    and the terminal had the key on it. I fixed that for ``--market`` by dropping
+    ``choices=``, then for ``--max-downloads`` by replacing ``type=int`` — twice
+    fixing the option in front of me. The subcommand slot was the third, and there is
+    no way to take ``choices=`` off a subparser: ``sikkerfil <a key>`` is a plausible
+    command/link mix-up and printed every character.
+
+    So this handles the class instead: every argparse message goes through here.
+    Runs long enough to be part of a key are replaced by their length; and if any
+    SPELLING of what is left still carries such a run — a fullwidth transcription
+    that NFKC folds back, standard base64's alphabet — the message is dropped
+    entirely rather than printed in the hope that the substitution caught it.
+    """
+    cleaned = _PATH_CHARACTERS.sub(lambda m: f"<{len(m.group())} characters>", text)
+    # THE FALLBACK ASKS FOR A WHOLE KEY, not a run, and that is a correction: a run
+    # test over the whitespace-folded spelling withheld "the following arguments are
+    # required: file", because "thefollowingargumentsarerequired" is thirty-two
+    # characters of the alphabet once the spaces come out. Prose reaches thirty-two;
+    # it does not reach forty-three characters that decode to a 32-byte key.
+    if any(
+        _holds_a_key(spelling) or _holds_a_key(_aliased(spelling))
+        for spelling in _spellings(cleaned)
+    ):
+        return "that value is not repeated here, because it could be a decryption key"
+    return cleaned
 
 
 def describe(value: str) -> str:
@@ -474,6 +596,11 @@ PATH_RUN = 32
 #: The base64url alphabet, which is what a key is spelled in. Anything outside it —
 #: a dot, a slash, a colon, a space — breaks a run, which is why hostnames and most
 #: filenames keep printing in full.
+#: How many characters a whole key is: base64url of 32 bytes, unpadded. Derived
+#: rather than written, because 43 is the sort of number that gets typed once and
+#: then disagreed with.
+KEY_TEXT_LENGTH = -(-KEY_BYTES * 4 // 3)
+
 _KEY_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{KEY_RUN},}}")
 _PATH_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{PATH_RUN},}}")
 
@@ -501,9 +628,57 @@ def _run_in(value: str, pattern: re.Pattern[str]) -> bool:
 
 
 def _spellings(value: str) -> tuple[str, ...]:
-    """``value`` as written, with whitespace out, and compatibility-normalised."""
+    """``value`` in every form a reader could get back out of it.
+
+    As written, with the whitespace out, and compatibility-normalised.
+
+    NOT PERCENT-DECODED, and that is a deliberate omission rather than an oversight.
+    Percent-decoding matters exactly where something downstream decodes before
+    acting, which is the hostname — urllib decodes a host before it resolves it — and
+    origin_of does that decode itself, explicitly, where it is tested. I had it here
+    too, for a while, and could not make a single test fail by taking it out: a
+    filesystem path is not decoded by anybody, a base URL may no longer carry a path
+    at all, and a reference is `[a-z0-9-]` or `[0-9A-Z]`, so a `%` in one is refused
+    before this is asked. Machinery no test can reach is machinery I have already
+    shipped believing in twice.
+
+    Not aliased here either: ``+`` and ``/`` are standard base64's pair, and folding
+    them into ``-_`` merges the components of a path into one long run, so an ordinary
+    ``/home/me/Documents/rapporter`` would read as key material. Values that are not
+    paths get that fold in opaque_carries_key_material, where it is safe.
+    """
     folded = unicodedata.normalize("NFKC", value)
     return (value, "".join(value.split()), folded, "".join(folded.split()))
+
+
+def _aliased(value: str) -> str:
+    """The same characters, read as base64url rather than standard base64.
+
+    ``("A" * 10 + "/") * 3 + "A" * 10`` is 43 characters that decode to 32 bytes the
+    moment somebody swaps the slashes for underscores, and the decoder here refuses
+    that spelling — which is correct as INPUT and was wrong as detection. "We would
+    not accept it" says nothing about whether printing it hands over a key: this is
+    the same mistake as the fullwidth transcription, in the other alphabet.
+    """
+    return value.replace("+", "-").replace("/", "_")
+
+
+def opaque_carries_key_material(value: str) -> bool:
+    """Whether a value that is NOT a path could carry key material.
+
+    A password, a content type, a share name: strings where ``/`` is an ordinary
+    character rather than a separator, so the standard-base64 alias can be folded
+    without merging anything that was meant to be apart.
+
+    AT THE PATH THRESHOLD, not the value one, because these are values a caller
+    chooses and refusing one costs them their password or their share name.
+    ``application/octet-stream`` folds to 24 characters and prints; 32 unbroken
+    characters of base64url is not a content type anybody wrote.
+    """
+    return any(
+        _PATH_CHARACTERS.search(spelling) or _PATH_CHARACTERS.search(_aliased(spelling))
+        for spelling in _spellings(value)
+    )
 
 
 def carries_key_material(value: str) -> bool:

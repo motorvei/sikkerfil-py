@@ -267,11 +267,17 @@ class Transport:
             # already had; this one hands the one secret the service is designed
             # never to hold straight to it, and no amount of redaction downstream
             # helps because the disclosure is the request itself.
-            shape = _CREDENTIAL_SHAPES.get(name)
+            # LOWERCASED, BECAUSE HTTP HEADER NAMES ARE CASE-INSENSITIVE. This
+            # library spells them through the constants, so nothing here missed the
+            # check — but a caller using Transport directly with the conventional
+            # "X-Sikkerfil-Token" got a dict miss and an unchecked credential, and
+            # the service reads that header just the same. A guard keyed on one
+            # spelling of a case-insensitive name is a guard with a spelling bypass.
+            shape = _CREDENTIAL_SHAPES.get(name.lower())
             if shape is not None and not shape.fullmatch(value):
                 expected = (
                     "an API key is sikkerfil_sk_ and then 43 characters of base64url"
-                    if name == KEY_HEADER
+                    if name.lower() == KEY_HEADER
                     else "a write token is wt_ and then 43 characters, exactly as "
                     "the service returned it as writeToken when the share was created"
                 )
