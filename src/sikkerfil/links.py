@@ -168,6 +168,23 @@ def build_link(origin: str, reference: str, key: str | bytes) -> str:
     # An id lives under /s/; a claimed name lives at the root, which is why
     # names.ts keeps a reserved list — a name is in the same namespace as the
     # site's own routes.
+    # THE REFERENCE IS A PATH SEGMENT, and a path is sent. A caller who transposed
+    # the id and the key got a link with the key BEFORE the '#', which every
+    # recipient's browser then hands to the server and its access logs — the one
+    # thing this library exists to prevent.
+    #
+    # CHECKED AGAINST THE PATTERNS, not against a run of key characters. A run test
+    # was the first thing I wrote here and it refused "kvartalsrapport-2026-q3",
+    # which is a perfectly good named link. The service's own two patterns are
+    # exact and already written down, and a key matches NEITHER — 43 characters
+    # exceeds the 32 of an id and the 40 of a name, and an id has no lowercase.
+    # Precision beats a heuristic when precision is available.
+    if not SHARE_ID.match(reference) and not SHARE_NAME.match(reference):
+        raise ConfigurationError(
+            f"{describe(reference)}. A link's path is sent to the server, so a key "
+            "belongs only after '#k='. A share id is "
+            f"{SHARE_ID.pattern} and a named link is {SHARE_NAME.pattern}."
+        )
     path = f"s/{reference}" if SHARE_ID.match(reference) else reference
     return f"{origin.rstrip('/')}/{path}#k={key_text(key)}"
 
@@ -238,7 +255,14 @@ def origin_of(link: str) -> str:
         return ""
     if not parts.scheme or not host or carries_key_material(host):
         return ""
-    return f"{parts.scheme}://{host}{f':{port}' if port else ''}"
+    # BRACKETS BACK ON FOR IPv6. urlsplit's `hostname` strips them — "[::1]" comes
+    # back as "::1" — so reassembling naively gives "http://::1:5000", which is not
+    # a URL. This is not cosmetic: parse_link STORES this as ParsedLink.origin and
+    # the module-level receive()/inspect() install it as the client's base_url, so a
+    # self-hosted or stub service on IPv6 simply stopped working. A regression I
+    # introduced by pointing the operational origin at this function.
+    authority = f"[{host}]" if ":" in host else host
+    return f"{parts.scheme}://{authority}{f':{port}' if port else ''}"
 
 
 def redacted(link: str) -> str:
@@ -255,6 +279,18 @@ def redacted(link: str) -> str:
     """
     origin = origin_of(link)
     return f"{origin}/<unrecognised>" if origin else "<unrecognised>"
+
+
+def path_carries_key_material(path: str) -> bool:
+    """Whether any COMPONENT of ``path`` could carry key material.
+
+    Per component and at :data:`PATH_RUN`, for the reason spelled out on
+    :func:`redacted_path`: real directories are full of long alphanumeric runs, and
+    the value threshold refuses half of them. I had already learned that and then
+    used the value threshold here anyway, which cost this suite's own tmp_path a
+    second time.
+    """
+    return any(_run_in(part, _PATH_CHARACTERS) for part in path.split("/"))
 
 
 def redacted_path(path: str) -> str:
@@ -274,7 +310,7 @@ def redacted_path(path: str) -> str:
     value, refusing costs nothing; for a path, refusing costs the name.
     """
     return "/".join(
-        f"<{len(part)} characters, not repeated>" if _PATH_CHARACTERS.search(part) else part
+        f"<{len(part)} characters, not repeated>" if _run_in(part, _PATH_CHARACTERS) else part
         for part in path.split("/")
     )
 
@@ -354,14 +390,36 @@ _KEY_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{KEY_RUN},}}")
 _PATH_CHARACTERS = re.compile(rf"[A-Za-z0-9_-]{{{PATH_RUN},}}")
 
 
+def _run_in(value: str, pattern: re.Pattern[str]) -> bool:
+    """Whether ``pattern`` matches ``value``, or ``value`` with the whitespace out.
+
+    BOTH SPELLINGS, ALWAYS, because the decoder accepts both. key_text takes a key
+    spelled with spaces between every character or wrapped across two lines, so a
+    run-based check that reads only the raw text sees no run and lets it through.
+    That was one bypass in the value check and then, once that was fixed, exactly
+    the same bypass again in the path check — a key across two lines splits into a
+    twenty and a twenty-three, and neither reaches the path threshold on its own.
+    One helper now, so there is one place to get it right.
+    """
+    return bool(pattern.search(value) or pattern.search("".join(value.split())))
+
+
 def carries_key_material(value: str) -> bool:
     """Whether ``value`` contains an unbroken run long enough to be part of a key.
 
     Deliberately blunter than :func:`looks_like_a_key`. That one answers "is this a
     key", which is worth saying in a message; this one answers "could printing this
     hand over part of one", which is the only question that matters before echoing.
+
+    CHECKED WITH THE WHITESPACE OUT AS WELL, because the decoder takes it out too.
+    ``key_text`` accepts a key spelled with a space between every character — that
+    was a deliberate kindness for keys wrapped by an email client — and a run-based
+    check reading the raw spelling sees no run at all. So ``" ".join(key)`` was
+    echoed in full, and deleting the spaces gave back a working key: my own
+    permissiveness defeating my own chokepoint. Anything the decoder would accept
+    has to be something this recognises.
     """
-    return bool(_KEY_CHARACTERS.search(value))
+    return _run_in(value, _KEY_CHARACTERS)
 
 
 def looks_like_a_key(value: str) -> bool:

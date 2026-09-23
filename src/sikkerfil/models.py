@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from . import links
+from .errors import ConfigurationError
 from .links import origin_of
 
 #: ``repr=False`` on the classes below is a SAFETY BELT, not the mechanism. A
@@ -181,6 +183,27 @@ class ReceivedFile:
         fails outright — and ``save("~/Downloads")`` is the obvious thing to
         write.
         """
+        # THE DIRECTORY IS A CALLER VALUE TOO, and a key pasted into it came back
+        # out through FileNotFoundError.filename — which holds the joined path, and
+        # which nothing in the message shows. This is the receiving side of the same
+        # mix-up as send(<key>): refused before the open, by the same rule, so the
+        # standard library never sees it.
+        if links.path_carries_key_material(directory):
+            raise ConfigurationError(
+                "that directory carries what looks like a decryption key, so it is "
+                "not repeated here. Pass the directory to write into — save('.') or "
+                "save('~/Downloads') — and keep the key out of it."
+            )
+        # AND THE EXPLICIT NAME, for the same reason but a worse outcome: this one
+        # does not just appear in a message, it CREATES A FILE named after the key —
+        # in directory listings, in backups, in whatever indexes that folder. A
+        # caller who passes a key here has mixed it up with a name.
+        if filename and links.path_carries_key_material(filename):
+            raise ConfigurationError(
+                "that filename carries what looks like a decryption key, so it is "
+                "not repeated here — and saving a file under that name would put "
+                "the key in the filesystem. Pass the name to write it under."
+            )
         chosen = filename or self.filename or f"sikkerfil-{self.share.id}.bin"
         safe = os.path.basename(chosen.replace("\\", "/")).lstrip(".") or f"{self.share.id}.bin"
         path = os.path.join(os.path.expanduser(directory), safe)

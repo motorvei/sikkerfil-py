@@ -32,12 +32,14 @@ import functools
 import inspect as pyinspect
 import io
 import typing
+import urllib.error
+import urllib.request
 from typing import Any
 
 import pytest
 
 import sikkerfil
-from sikkerfil import cli, crypto, links
+from sikkerfil import cli, crypto, links, models
 
 #: The key this file hunts for. Every variant is derived from it, and it is always
 #: what the search looks for — the point of "a character short" is that 42 of 43
@@ -62,6 +64,11 @@ KEYS = {
     "as a hostname label": BASE + ".example",
     "as userinfo": "user:" + BASE,
     "with a suffix": BASE + "-old",
+    # SPELLED WITH SPACES, which key_text accepts on purpose and a run-based check
+    # could not see: this one was echoed in full, and deleting the spaces gave back
+    # a working key. Anything the decoder accepts belongs in this table.
+    "spaced between every character": " ".join(BASE),
+    "wrapped across two lines": BASE[:20] + "\n" + BASE[20:],
 }
 
 #: One definition, in the library, of how long a run has to be to matter — so what
@@ -139,13 +146,62 @@ def _callables() -> list[tuple[str, Any]]:
         if callable(obj) and not isinstance(obj, type):
             found.append((f"sikkerfil.{name}", obj))
 
-    client = sikkerfil.Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0)
+    # NOT PRODUCTION. With no base_url this client defaulted to https://sikkerfil.no
+    # and several generated calls passed validation and went to the WIRE: one run
+    # made fourteen real requests to the live service, and every 404 or DNS failure
+    # then counted toward "a refusal was reached", so the sweep could look thorough
+    # while exercising nothing. 127.0.0.1:9 is the discard port — nothing listens,
+    # the connection is refused locally and instantly, and _no_network below turns
+    # any request that still escapes into a failure rather than a passing case.
+    client = sikkerfil.Sikkerfil(
+        api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9"
+    )
     for name in dir(client):
         if name.startswith("_"):
             continue
         obj = getattr(client, name)
         if callable(obj):
             found.append((f"Sikkerfil.{name}", obj))
+
+    # METHODS ON THE OBJECTS THE LIBRARY HANDS BACK. Excluding every class meant
+    # the sweep never saw a public method outside Sikkerfil — and ReceivedFile.save
+    # takes a DIRECTORY from the caller, which is the receiving-side twin of
+    # send(<key>). It raised a FileNotFoundError whose `.filename` held the key,
+    # an attribute this file explicitly claims to read. Claiming to read it while
+    # never constructing the object that produces it is the kind of coverage that
+    # looks thorough on paper.
+    share = models.Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    instances: list[tuple[str, Any]] = [
+        ("ReceivedFile", models.ReceivedFile(b"x", "rapport.pdf", "application/pdf", share)),
+        ("Share", share),
+        (
+            "SentShare",
+            models.SentShare(
+                id="ABCD1234",
+                url="http://127.0.0.1:9/s/ABCD1234#k=" + BASE,
+                write_token="wt_x",
+                key=BASE,
+                expires_at=0,
+                size_bytes=1,
+            ),
+        ),
+        ("Sealed", crypto.seal(b"x")),
+    ]
+    for kind, instance in instances:
+        for name in dir(instance):
+            if name.startswith("_"):
+                continue
+            obj = getattr(instance, name)
+            if callable(obj):
+                found.append((f"{kind}.{name}", obj))
 
     for module in (links, crypto, cli):
         for name in dir(module):
@@ -222,8 +278,37 @@ def _string_parameters(fn: Any) -> tuple[list[str], bool]:
     return chosen, resolved
 
 
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every outbound request becomes a failure, not a quietly-counted refusal.
+
+    A sweep that reaches the network is measuring somebody else's uptime. Worse,
+    the exception it gets back is a transport error that happens to contain no key,
+    so the case PASSES and looks covered. Recording the attempts lets the test
+    assert it stayed local instead of assuming it.
+    """
+    # THE MODULE-LEVEL receive()/inspect() BUILD THEIR OWN CLIENT from the link's
+    # origin, so pointing the Sikkerfil instance at the discard port fixed only half
+    # of it — a bare id or key falls back to the default market, which is
+    # production. _client_for honours SIKKERFIL_BASE_URL above the link precisely so
+    # this cannot happen, and its docstring says so; I had simply not set it.
+    monkeypatch.setenv("SIKKERFIL_BASE_URL", "http://127.0.0.1:9")
+
+    attempted: list[str] = []
+
+    def refuse(request: Any, *args: Any, **kwargs: Any) -> Any:
+        url = getattr(request, "full_url", str(request))
+        attempted.append(url)
+        raise urllib.error.URLError("the sweep does not use the network")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    return attempted
+
+
 @pytest.mark.parametrize("spelling", list(KEYS), ids=list(KEYS))
-def test_no_public_entry_point_echoes_a_key_it_was_handed(spelling: str) -> None:
+def test_no_public_entry_point_echoes_a_key_it_was_handed(
+    spelling: str, _no_network: list[str]
+) -> None:
     handed = KEYS[spelling]
     # Always hunt for the REAL key, whatever variant went in.
     key = LOWERCASE if spelling == "all lowercase" else BASE
@@ -296,6 +381,37 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(spelling: str) -> None
         unresolved
     )
 
+    # THE CLI TAKES argv, WHICH IS A SEQUENCE, so substituting a string into one
+    # parameter cannot reach it and it was skipped wholesale — leaving every
+    # argparse-owned message unchecked. argparse formats a bad choice as
+    # "invalid choice: %(value)r", so `--market <key>` wrote the key to stderr and
+    # never reached the sanitised base_url_for at all. Shaped argv, then.
+    for argv in (
+        ["--market", handed, "list"],
+        ["receive", handed],
+        ["inspect", handed],
+        ["send", handed],
+        ["revoke", handed, "--write-token", "wt_x"],
+        ["audit", handed, "--write-token", "wt_x"],
+        ["send", "rapport.pdf", "--expires", handed],
+    ):
+        out, err = io.StringIO(), io.StringIO()
+        calls += 1
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                cli.main(argv)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
+            raised += 1
+            written = _chain(exc)
+        else:
+            written = ""
+        written += "\n" + out.getvalue().lower() + err.getvalue().lower()
+        if any(key[i : i + RUN].lower() in written for i in range(len(key) - RUN + 1)):
+            leaked.append(f"cli.main({argv[0]} …)")
+    reached.add("cli.main(argv)")
+
     # Named anchors, so a sweep that quietly stops reaching things says so. Each is a
     # slot a key has actually been mispasted into, or plainly could be.
     for anchor in (
@@ -306,9 +422,18 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(spelling: str) -> None
         "Sikkerfil.audit(share)",
         "sikkerfil.links.base_url_for(market)",
         "sikkerfil.cli.duration(text)",
+        "ReceivedFile.save(directory)",
+        "cli.main(argv)",
     ):
         assert anchor in reached, f"the sweep no longer reaches {anchor}"
 
     assert not leaked, "these echoed the key they were handed:\n  " + "\n  ".join(
         sorted(set(leaked))
+    )
+
+    # Said out loud, because "it did not leak" is worth nothing if the call never
+    # ran the code under test and merely failed to resolve a hostname.
+    outside = [u for u in _no_network if "127.0.0.1:9" not in u]
+    assert not outside, "the sweep tried to leave the machine:\n  " + "\n  ".join(
+        sorted(set(outside))
     )

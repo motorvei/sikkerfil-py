@@ -411,3 +411,73 @@ def test_a_refused_key_leaves_no_exception_to_walk() -> None:
     with pytest.raises(ConfigurationError) as caught:
         parse_link(f"https://[oops/x#k={SECRET}")
     assert caught.value.__context__ is None, repr(caught.value.__context__)
+
+
+def test_a_credential_with_a_newline_in_it_never_reaches_http_client() -> None:
+    """ASCII was not enough, and the stdlib's own validation is not safe to reach.
+
+    CR and LF are ASCII, so a credential wrapped across two lines in a config file
+    passed the first version of this guard — and then http.client raised
+    ValueError("Invalid header value b'<the whole credential>'"), which is neither
+    one of our errors nor redacted. A control character in a header is also how
+    header injection is spelled, so there was never a reason to allow one.
+    """
+    from sikkerfil import Sikkerfil
+
+    client = Sikkerfil(api_key="sikkerfil_sk_" + "x" * 43, retries=0, base_url="http://127.0.0.1:9")
+    for bad in (f"wt_{SECRET}\r\nX: y", f"wt_{SECRET}\n", f"wt_{SECRET}\x7f", f"wt_{SECRET}\x00"):
+        with pytest.raises(ConfigurationError, match="cannot be sent"):
+            client.revoke("ABCD1234", write_token=bad)
+        # And nothing of it comes back, through the message or the chain.
+        try:
+            client.revoke("ABCD1234", write_token=bad)
+        except ConfigurationError as exc:
+            assert not _leaks(str(exc)), str(exc)
+            assert exc.__context__ is None
+
+
+def test_saving_under_a_key_shaped_name_is_refused_before_it_touches_the_disk() -> None:
+    """Worse than a message: this one would CREATE a file named after the key.
+
+    In directory listings, in backups, in whatever indexes that folder. Both the
+    directory and the explicit filename are caller values, and both reach a path.
+    """
+    from sikkerfil.models import ReceivedFile, Share
+
+    share = Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    got = ReceivedFile(
+        data=b"x", filename="rapport.pdf", content_type="application/pdf", share=share
+    )
+
+    for kwargs in ({"directory": SECRET}, {"directory": ".", "filename": SECRET}):
+        with pytest.raises(ConfigurationError) as caught:
+            got.save(**kwargs)
+        assert not _leaks(str(caught.value)), str(caught.value)
+
+
+def test_an_ordinary_save_still_works(tmp_path: object) -> None:
+    # The guards above must not cost the normal case, which is the whole point of
+    # using the path threshold rather than the value one.
+    from sikkerfil.models import ReceivedFile, Share
+
+    share = Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    got = ReceivedFile(data=b"hei", filename="rapport.pdf", content_type="x", share=share)
+    written = got.save(str(tmp_path))
+    assert written.endswith("rapport.pdf")
+    assert got.save(str(tmp_path), filename="kvartalsrapport-2026-q3.pdf").endswith(".pdf")

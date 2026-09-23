@@ -216,12 +216,20 @@ class Transport:
         # sikkerfil_sk_…, base64url — so a value that is not is a caller mistake,
         # and it is refused by NAME rather than by value.
         for name, value in headers.items():
-            if not value.isascii():
+            # ASCII IS NOT ENOUGH, which is where the first version of this stopped.
+            # CR and LF are ASCII, so a credential wrapped across two lines in a
+            # config file sailed through — and then http.client's own validation
+            # raised ValueError("Invalid header value b'<the whole credential>'"),
+            # which is neither one of our errors nor redacted. A control character
+            # in a header is also how header injection is spelled, so there are two
+            # reasons to refuse it and no reason to allow it.
+            if not value.isascii() or any(c < " " or c == "\x7f" for c in value):
                 raise ConfigurationError(
-                    f"the {name} header is not ASCII, so it cannot be sent. Its "
-                    "value is not repeated here, because the headers this library "
-                    "sets carry credentials. A smart quote from a copied document "
-                    "is the usual cause."
+                    f"the {name} header contains a character that cannot be sent: "
+                    "it must be printable ASCII. The value is not repeated here, "
+                    "because the headers this library sets carry credentials. A "
+                    "smart quote from a copied document, or a credential wrapped "
+                    "across two lines, is the usual cause."
                 )
 
         attempt = 0

@@ -51,10 +51,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         epilog="Protocol documentation: https://sikkerfil.no/utviklere",
     )
     parser.add_argument("--version", action="version", version=f"sikkerfil {__version__}")
+    # NO choices= HERE, deliberately. argparse formats a rejected choice as
+    # "invalid choice: %(value)r" and writes it to stderr itself, so `--market
+    # <a key>` printed the key and never reached base_url_for, which exists to
+    # refuse it without echoing. Validated below instead, by the one function that
+    # already knows how — the help text still lists the markets, so nothing is lost
+    # but the leak.
     parser.add_argument(
         "--market",
-        choices=sorted(MARKETS),
         default=None,
+        metavar="{" + ",".join(sorted(MARKETS)) + "}",
         help=f"which front door to use (default: {DEFAULT_MARKET})",
     )
     sub = parser.add_subparsers(dest="command", required=True)

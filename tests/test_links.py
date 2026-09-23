@@ -243,3 +243,54 @@ def test_a_key_in_the_wrong_place_is_named_as_a_key_however_it_is_spelled(
     """
     with pytest.raises(ConfigurationError, match="is a decryption key"):
         parse_link(spelling)
+
+
+@pytest.mark.parametrize(
+    "link,expected",
+    [
+        ("http://[::1]:5000/s/ABCD1234", "http://[::1]:5000"),
+        ("http://[::1]/s/ABCD1234", "http://[::1]"),
+        ("http://[2001:db8::1]:8080/s/ABCD1234", "http://[2001:db8::1]:8080"),
+        ("http://127.0.0.1:5000/s/ABCD1234", "http://127.0.0.1:5000"),
+        ("https://sikkerfil.no/s/ABCD1234", "https://sikkerfil.no"),
+    ],
+)
+def test_an_ipv6_origin_keeps_its_brackets(link: str, expected: str) -> None:
+    """A REGRESSION I INTRODUCED, and a functional one rather than a leak.
+
+    Pointing ParsedLink.origin at origin_of() fixed a credential leak and broke
+    IPv6: urlsplit's `hostname` strips the brackets, so "[::1]" came back as "::1"
+    and reassembling gave "http://::1:5000", which is not an address. That value is
+    stored as the origin and installed as the client's base_url, so a self-hosted or
+    stub service on IPv6 simply stopped working — silently, because nothing in the
+    suite used one.
+    """
+    from sikkerfil.links import origin_of
+
+    assert origin_of(link) == expected
+    assert parse_link(link).origin == expected
+
+
+def test_a_key_where_the_reference_goes_is_refused() -> None:
+    """A path is SENT. A key there is the one thing this library exists to prevent.
+
+    A caller who transposed the id and the key got a link with the key before the
+    '#', which every recipient's browser hands to the server and its access logs.
+    """
+    with pytest.raises(ConfigurationError, match="path is sent"):
+        build_link("https://sikkerfil.no", KEY, KEY)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["ABCD1234", "A1B2C3D4E5F6G7H8", "kvartalsrapport", "kvartalsrapport-2026-q3", "abc"],
+)
+def test_every_real_reference_still_builds(reference: str) -> None:
+    """The check is the service's own two patterns, not a run of key characters.
+
+    A run test was the first thing I wrote and it refused "kvartalsrapport-2026-q3",
+    a perfectly good named link — twenty-three unbroken characters. The patterns are
+    exact and already written down, and a 43-character key matches neither, so
+    precision was available and a heuristic was not needed.
+    """
+    assert build_link("https://sikkerfil.no", reference, KEY).endswith(KEY)
