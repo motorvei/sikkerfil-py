@@ -147,3 +147,113 @@ def test_the_redaction_keeps_what_a_caller_needs() -> None:
 
     assert redacted(f"https://sikkerfil.dk/A/B#k={SECRET}") == "https://sikkerfil.dk/<unrecognised>"
     assert redacted("http://127.0.0.1:54321/A/B") == "http://127.0.0.1:54321/<unrecognised>"
+
+
+# --- Not a message at all: the repr of an object the caller holds --------------
+#
+# Everything above is about text the library WRITES. This is about a default it
+# inherits. Found by asking what else puts a key somewhere nobody chose to put
+# it, after three rounds of review in which I fixed the case I was shown and not
+# the class.
+
+
+def test_a_sent_share_does_not_print_its_own_key_or_token() -> None:
+    from sikkerfil.models import SentShare
+
+    sent = SentShare(
+        id="ABCD1234",
+        url=f"https://sikkerfil.dk/s/ABCD1234#k={SECRET}",
+        write_token="wt_" + "z" * 20,
+        key=SECRET,
+        expires_at=1700000000,
+        size_bytes=99,
+    )
+    text = repr(sent)
+    assert not _leaks(text), text
+    assert "wt_zzz" not in text, "the write token is issued once and is a credential"
+    # Still useful, or the next person goes back to printing the whole object.
+    assert "ABCD1234" in text
+    assert "https://sikkerfil.dk" in text
+
+
+def test_a_named_share_does_not_print_its_key_either() -> None:
+    """The case my own first version of that repr got wrong.
+
+    It took everything before "/s/" as the origin, and str.partition returns the
+    WHOLE string when the separator is absent — so a named link, which has no
+    "/s/", came back complete with its fragment. Fixing the shape I had in front
+    of me and not the question is the mistake this whole file exists to catch.
+    """
+    from sikkerfil.models import SentShare
+
+    sent = SentShare(
+        id="ABCD1234",
+        url=f"https://sikkerfil.no/kvartalsrapport#k={SECRET}",
+        write_token="wt_x",
+        key=SECRET,
+        expires_at=0,
+        size_bytes=1,
+        name="kvartalsrapport",
+    )
+    assert not _leaks(repr(sent)), repr(sent)
+
+
+def test_a_sealed_envelope_does_not_print_its_key() -> None:
+    sealed = crypto.seal(b"kvartalsrapport")
+    text = repr(sealed)
+    assert repr(sealed.key) not in text, text
+    assert str(sealed.key) not in text, text
+    assert "<hidden>" in text
+
+
+def test_a_received_file_does_not_print_the_file() -> None:
+    # The plaintext is the thing being protected. A repr that dumps it is the
+    # same failure as one that dumps the key.
+    from sikkerfil.models import ReceivedFile, Share
+
+    share = Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    got = ReceivedFile(
+        data=b"Omsetning: 4 200 000 NOK", filename="r.pdf", content_type="x", share=share
+    )
+    assert b"Omsetning".decode() not in repr(got), repr(got)
+    assert "24 bytes" in repr(got)
+
+
+def test_the_ordinary_logging_line_does_not_write_the_key() -> None:
+    """THE PATH THAT MATTERS, end to end. Nobody reprs an object on purpose.
+
+        logger.info("sent %s", sent)
+
+    is an unremarkable line to write, and with the default dataclass repr it put
+    the decryption key and the once-issued write token into whatever the
+    application logs to.
+    """
+    import io
+    import logging
+
+    from sikkerfil.models import SentShare
+
+    stream = io.StringIO()
+    logging.basicConfig(stream=stream, level=logging.INFO, force=True)
+    sent = SentShare(
+        id="ABCD1234",
+        url=f"https://sikkerfil.no/s/ABCD1234#k={SECRET}",
+        write_token="wt_" + "z" * 20,
+        key=SECRET,
+        expires_at=0,
+        size_bytes=1,
+    )
+    logging.getLogger("an.application").info("sent %s", sent)
+    written = stream.getvalue()
+
+    assert "sent SentShare" in written, "the log line did not happen — the test proves nothing"
+    assert not _leaks(written), written
+    assert "wt_zzz" not in written, written

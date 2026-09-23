@@ -21,6 +21,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from .links import origin_of
+
+#: ``repr=False`` on the classes below is a SAFETY BELT, not the mechanism. A
+#: dataclass does not overwrite a ``__repr__`` defined in the class body, so the
+#: explicit ones are what take effect either way. It matters if one of them is
+#: ever deleted: with ``repr=False`` the class falls back to object's repr, which
+#: shows no fields, instead of silently regaining a generated one that prints the
+#: key. No test can tell the difference today, which is why it is written down.
+
 
 def _utc(epoch: int) -> datetime:
     return datetime.fromtimestamp(epoch, tz=timezone.utc)
@@ -71,7 +80,7 @@ class Share:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class SentShare:
     """The result of a send: a link to give somebody, and a token to keep.
 
@@ -99,8 +108,32 @@ class SentShare:
     def expires(self) -> datetime:
         return _utc(self.expires_at)
 
+    def __repr__(self) -> str:
+        """Without the key, the link's fragment, or the write token.
 
-@dataclass(frozen=True)
+        THE DEFAULT REPR PUT ALL THREE IN EVERY LOG THAT TOUCHED THIS OBJECT.
+        ``logger.info("sent %s", sent)`` is an ordinary line to write, and it
+        wrote the decryption key and the once-issued write token into whatever
+        the application logs to. The caller chose to hold those; they did not
+        choose to print them.
+
+        What is left is what identifies the share — the id, the market, when it
+        expires — which is what anyone reading a log actually wants.
+
+        THE FIRST VERSION OF THIS LEAKED. It took everything before ``/s/`` as the
+        origin, and ``partition`` returns the WHOLE string when the separator is
+        absent — so a NAMED link, which has no ``/s/``, came back complete with its
+        fragment. Hence origin_of, which is the one place that answers this.
+        """
+        return (
+            f"SentShare(id={self.id!r}, origin={origin_of(self.url)!r}, "
+            f"expires_at={self.expires_at}, size_bytes={self.size_bytes}, "
+            f"name={self.name!r}, url=<carries the key>, "
+            f"key=<hidden>, write_token=<hidden>)"
+        )
+
+
+@dataclass(frozen=True, repr=False)
 class ReceivedFile:
     """A decrypted file, in memory.
 
@@ -116,6 +149,14 @@ class ReceivedFile:
 
     def __len__(self) -> int:
         return len(self.data)
+
+    def __repr__(self) -> str:
+        """Without the plaintext. It is the file — the whole thing being protected."""
+        return (
+            f"ReceivedFile(filename={self.filename!r}, "
+            f"content_type={self.content_type!r}, data=<{len(self.data)} bytes>, "
+            f"share={self.share.id!r})"
+        )
 
     def save(self, directory: str = ".", *, filename: str | None = None) -> str:
         """Write the bytes to disk and return the path written.

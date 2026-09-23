@@ -149,7 +149,7 @@ def new_key() -> bytes:
     return os.urandom(KEY_BYTES)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Sealed:
     """One encrypted file: the bytes to upload, and the key that opens them."""
 
@@ -162,6 +162,19 @@ class Sealed:
     def key_text(self) -> str:
         """The key as it appears after ``#k=`` in a share link."""
         return b64url_encode(self.key)
+
+    def __repr__(self) -> str:
+        """Without the key. A dataclass repr would have printed it in full.
+
+        ``repr=False`` above is a safety belt rather than the mechanism — a
+        dataclass leaves a ``__repr__`` defined in the body alone — so deleting
+        this method falls back to object's repr instead of a generated one.
+
+        This is the last way the key reached a log without anyone deciding it
+        should: not a message we write, but the DEFAULT repr of an object a
+        caller holds. One ``print(sealed)`` while debugging an upload was enough.
+        """
+        return f"Sealed(blob=<{len(self.blob)} bytes>, key=<hidden>)"
 
 
 def seal(plaintext: bytes, key: bytes | None = None) -> Sealed:

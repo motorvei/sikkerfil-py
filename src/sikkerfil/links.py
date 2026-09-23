@@ -170,6 +170,29 @@ def _key_from_fragment(fragment: str) -> str | None:
     return unquote(fragment) or None
 
 
+def origin_of(link: str) -> str:
+    """``scheme://host[:port]``, or ``""`` when the address will not parse.
+
+    THE ONE PLACE THAT DECIDES WHERE A LINK'S ORIGIN ENDS. Everything that needs
+    to name a link without its secrets needs this, and every hand-rolled version
+    of it has been wrong: splitting on ``/`` took a whole key to be the host when
+    a link used ``?`` instead of ``#``, and taking everything before ``/s/``
+    returned the entire link for a NAMED share, fragment and all.
+
+    urlsplit knows where an authority ends. ``hostname`` rather than ``netloc``,
+    because netloc carries ``user:password@``. The port stays: it is not a secret,
+    and a stub or a self-hosted origin needs it to be recognisable.
+    """
+    try:
+        parts = urlsplit(link)
+        host, port = parts.hostname, parts.port
+    except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
+        return ""
+    if not parts.scheme or not host:
+        return ""
+    return f"{parts.scheme}://{host}{f':{port}' if port else ''}"
+
+
 def redacted(link: str) -> str:
     """``link`` with everything that might be a secret taken out.
 
@@ -177,30 +200,13 @@ def redacted(link: str) -> str:
     PRODUCT, and an exception message is a log line: applications log what they
     did not catch, and error trackers keep it for months.
 
-    The ORIGIN is kept. It says which market the caller aimed at, which is what
-    they need to see, and it is never a secret.
-
-    THE PATH GOES TOO, not just the fragment. Every caller of this function is
+    The origin is kept — it says which market the caller aimed at, and is never a
+    secret. THE PATH GOES TOO, not just the fragment: every caller of this is
     about to say it did not recognise the link, so by definition we do not know
-    what its parts are — and one of the things a path can be is the key, from a
-    sender who kept the id and the key separately and pasted the wrong one.
-    Stripping only the fragment left that case fully exposed.
+    what its parts are, and one thing a path can be is the key.
     """
-    # PARSED, NOT SPLIT ON '/'. Splitting kept everything up to the first slash,
-    # so a link using '?' instead of '#' — https://sikkerfil.no?k=<key>, an easy
-    # near miss — had no slash at all and the whole key came through as the
-    # "host". urlsplit knows where the authority ends.
-    #
-    # hostname rather than netloc, because netloc carries userinfo:
-    # https://user:hunter2@host/… would otherwise put the password in the message.
-    try:
-        parts = urlsplit(link)
-        host, port = parts.hostname, parts.port
-    except ValueError:  # a malformed authority, e.g. a bad IPv6 literal or port
-        return "<unrecognised>"
-    if not parts.scheme or not host:
-        return "<unrecognised>"
-    return f"{parts.scheme}://{host}{f':{port}' if port else ''}/<unrecognised>"
+    origin = origin_of(link)
+    return f"{origin}/<unrecognised>" if origin else "<unrecognised>"
 
 
 def _describe(value: str) -> str:
