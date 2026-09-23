@@ -12,6 +12,7 @@ that must not be in it.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -478,16 +479,20 @@ def test_a_key_in_a_send_parameter_never_reaches_the_body(
     text = crypto.b64url_encode(key)
     before = len(stub.requests)
     for spelling in (text, f"user:{text}", f"{text}-old", text + "=="):
+        given: dict[str, Any] = {slot: spelling}
         with pytest.raises(ConfigurationError) as caught:
-            client.send(PLAINTEXT, **{slot: spelling})
+            client.send(PLAINTEXT, **given)
         assert text not in str(caught.value)
         assert "decryption key" in str(caught.value)
     assert len(stub.requests) == before, "the share was created before the refusal"
 
-    # And an ordinary value of each still goes through.
-    ordinary = {
-        "name": "kvartalsrapport-2026-q3",
-        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "password": "hemmelig-passord",
-    }[slot]
-    client.send(PLAINTEXT, **{slot: ordinary})
+    # And an ordinary value of each still goes through, or the guard has taken the
+    # feature away rather than protected it.
+    ordinary: dict[str, Any] = {
+        slot: {
+            "name": "kvartalsrapport-2026-q3",
+            "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "password": "hemmelig-passord",
+        }[slot]
+    }
+    client.send(PLAINTEXT, **ordinary)
