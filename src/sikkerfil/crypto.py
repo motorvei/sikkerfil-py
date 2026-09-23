@@ -72,6 +72,10 @@ def b64url_decode(text: str) -> bytes:
     kept the padding, and may have picked up whitespace. Refusing a correct key
     over a presentational detail is not a security property.
 
+    WHITESPACE IS THE ONLY THING TOLERATED. Anything else outside the base64url
+    alphabet is refused rather than silently dropped — see the comment on
+    ``validate=True`` below, which is the fix that closed a whole class of bypass.
+
     WHITESPACE GOES BEFORE THE PADDING IS COUNTED, and that order is the whole
     point. base64 decoding DISCARDS whitespace but the padding calculation COUNTS
     it, so without this a key with ONE internal space was refused while the same
@@ -81,7 +85,11 @@ def b64url_decode(text: str) -> bytes:
     characters, so a key with a character genuinely missing is still short, and
     every caller that wants a key checks the length.
     """
-    compact = "".join(text.split())
+    # STRIPPED OF PADDING BEFORE PADDING IS ADDED. Computing the padding without
+    # removing what is already there worked only while the decoder was lenient: a key
+    # that arrived as "…3u4==" got three MORE '=' appended, and strict decoding
+    # rightly refuses five. An existing test for a padded key caught it.
+    compact = "".join(text.split()).rstrip("=")
     padded = compact + "=" * (-len(compact) % 4)
 
     # THE STDLIB ERROR CARRIES THE VALUE. A UnicodeEncodeError holds the entire
@@ -93,9 +101,24 @@ def b64url_decode(text: str) -> bytes:
     # Still a ValueError, because that is what a decoder raises and what callers
     # catch (binascii.Error and UnicodeEncodeError are both ValueErrors). Raised
     # after the handler has exited, so nothing is left on __context__ either.
+    # validate=True, WHICH IS THE ROOT FIX AND NOT A DETAIL. It comes via b64decode
+    # with explicit altchars because urlsafe_b64decode HAS NO validate parameter —
+    # passing one raises TypeError, which my first attempt did, and the catch below
+    # turned that into "every key is invalid". Without it
+    # urlsafe_b64decode silently DISCARDS every character outside the alphabet — not
+    # just the whitespace removed above — so a key with dots sprinkled through it
+    # decoded to the key while looking nothing like one:
+    #
+    #     ".".join(chunks of the key) + "."   ->  decodes to the key
+    #
+    # Every "spelling" bypass on this branch came from that permissiveness, and I had
+    # been answering them one at a time by teaching the LEAK CHECK another
+    # transformation — whitespace, then NFKC — which is an open-ended list I would
+    # keep losing. Strict decoding closes the set instead: what this accepts is now
+    # base64url, plus the whitespace stripped a line above, and nothing else.
     decoded: bytes | None = None
     try:
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        decoded = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
     except (TypeError, ValueError):
         decoded = None
     if decoded is None:

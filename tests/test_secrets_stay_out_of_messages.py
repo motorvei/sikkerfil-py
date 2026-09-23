@@ -481,3 +481,119 @@ def test_an_ordinary_save_still_works(tmp_path: object) -> None:
     written = got.save(str(tmp_path))
     assert written.endswith("rapport.pdf")
     assert got.save(str(tmp_path), filename="kvartalsrapport-2026-q3.pdf").endswith(".pdf")
+
+
+# --- Round nine: the decoder's permissiveness was the root of the whole class ----
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [".", ",", "/", "+", ":", "*", "%", "\x00"],
+)
+def test_a_key_smuggled_past_the_run_check_by_punctuation_is_refused(separator: str) -> None:
+    """THE ROOT CAUSE, and the reason chasing spellings was the wrong strategy.
+
+    urlsafe_b64decode DISCARDS every character outside the alphabet, not only the
+    whitespace this library strips on purpose. So a key with dots sprinkled through
+    it decoded to the key while containing no twelve-character run — and the leak
+    check, which reads runs, echoed the whole thing. Deleting the dots gave it back.
+
+    I had been answering each of these by teaching the CHECK another transformation:
+    whitespace, then NFKC. That is an open-ended list and I would have kept losing
+    it. Strict decoding closes the set instead — base64url plus the whitespace we
+    remove, and nothing else — so there is no third spelling to discover.
+    """
+    spelled = separator.join(SECRET[i : i + 11] for i in range(0, len(SECRET), 11))
+    with pytest.raises((ConfigurationError, ValueError)):
+        crypto.key_text(spelled)
+
+
+def test_whitespace_and_padding_are_still_tolerated() -> None:
+    # Strictness must not cost the leniency that was deliberate. A key wrapped by a
+    # mail client or padded by a config file is a correct key.
+    for spelling in (
+        SECRET,
+        SECRET + "=",
+        SECRET + "==",
+        " ".join(SECRET),
+        SECRET[:20] + "\n" + SECRET[20:],
+        "\t" + SECRET + "\n",
+        SECRET + "==\n",
+    ):
+        assert crypto.key_text(spelling) == SECRET, spelling[:24]
+
+
+@pytest.mark.parametrize(
+    "link",
+    ["https:///s/ABCD1234", "http://localhost:bad/s/ABCD1234", "https://:8080/s/ABCD1234"],
+)
+def test_an_absolute_link_with_no_usable_origin_is_refused(link: str) -> None:
+    """Otherwise a typo in a self-hosted link silently goes to production.
+
+    These parsed: the share path was fine and the origin came back EMPTY — which is
+    indistinguishable from "they typed just the id", so _client_for fell back to the
+    default market. The lookup for a staging share went to the live service.
+    """
+    with pytest.raises(ConfigurationError):
+        parse_link(link)
+
+    # A bare reference still works, because that ambiguity was the whole problem.
+    assert parse_link("ABCD1234").share_id == "ABCD1234"
+
+
+def test_build_link_refuses_an_origin_that_could_carry_a_key() -> None:
+    """The other half of everything before the '#'.
+
+    I fixed `reference` last round and left `origin`. A key as the origin puts it in
+    the link; "https://<key>.example" is worse, because it looks valid and sends the
+    key through DNS and the request authority on the first click.
+    """
+    for origin in (SECRET, f"https://{SECRET}.example", "not-an-origin", ""):
+        with pytest.raises(ConfigurationError):
+            build_link(origin, "ABCD1234", SECRET)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://sikkerfil.no",
+        "https://sikkerfil.no/",
+        "http://127.0.0.1:5000",
+        "http://[::1]:5000",
+    ],
+)
+def test_build_link_still_accepts_every_real_origin(origin: str) -> None:
+    assert build_link(origin, "ABCD1234", SECRET).endswith(SECRET)
+
+
+def test_a_sender_cannot_make_the_recipient_write_a_file_named_after_the_key() -> None:
+    """The guard tested the ARGUMENT and not the value it defaults to.
+
+    self.filename is the DECRYPTED name, which save()'s own docstring already calls
+    attacker-controlled. So a sender could send(data, filename=<a key>) and the
+    recipient's perfectly ordinary save(dir) wrote a file named after it — no mistake
+    required at the receiving end at all. Guarding the caller's argument protected
+    them from themselves and not from the sender, which is the wrong threat.
+    """
+    import tempfile
+
+    from sikkerfil.models import ReceivedFile, Share
+
+    share = Share(
+        id="ABCD1234",
+        state="ready",
+        size_bytes=1,
+        content_type="application/pdf",
+        expires_at=0,
+        downloads_remaining=None,
+        password_required=False,
+    )
+    hostile = ReceivedFile(data=b"x", filename=SECRET, content_type="x", share=share)
+    directory = tempfile.mkdtemp()
+
+    with pytest.raises(ConfigurationError) as caught:
+        hostile.save(directory)
+    assert not _leaks(str(caught.value)), str(caught.value)
+
+    # The recipient is not stuck: they can name it themselves.
+    assert hostile.save(directory, filename="rapport.pdf").endswith("rapport.pdf")

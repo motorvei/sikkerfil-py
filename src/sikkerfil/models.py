@@ -194,17 +194,25 @@ class ReceivedFile:
                 "not repeated here. Pass the directory to write into — save('.') or "
                 "save('~/Downloads') — and keep the key out of it."
             )
-        # AND THE EXPLICIT NAME, for the same reason but a worse outcome: this one
-        # does not just appear in a message, it CREATES A FILE named after the key —
-        # in directory listings, in backups, in whatever indexes that folder. A
-        # caller who passes a key here has mixed it up with a name.
-        if filename and links.path_carries_key_material(filename):
-            raise ConfigurationError(
-                "that filename carries what looks like a decryption key, so it is "
-                "not repeated here — and saving a file under that name would put "
-                "the key in the filesystem. Pass the name to write it under."
-            )
         chosen = filename or self.filename or f"sikkerfil-{self.share.id}.bin"
+
+        # CHECKED AFTER CHOOSING, which is the whole point. The first version tested
+        # the explicit `filename` argument only — and self.filename is the DECRYPTED
+        # name, which the docstring above already calls attacker-controlled. So a
+        # sender could send(data, filename=<a key>) and the recipient's perfectly
+        # ordinary save(dir) wrote a file named after it, no mistake required at the
+        # receiving end at all. Guarding the argument and not the value it defaults to
+        # protected the caller from themselves and not from the sender.
+        #
+        # It CREATES A FILE, so this is worse than a message: directory listings,
+        # backups, whatever indexes that folder, and one `git add -A` from a commit.
+        if links.path_carries_key_material(chosen):
+            raise ConfigurationError(
+                "the name this file would be saved under carries what looks like a "
+                "decryption key, so it is not repeated here — writing it would put "
+                "the key in the filesystem. Pass filename= to choose another name. "
+                "If it came sealed with the file, the sender put it there."
+            )
         safe = os.path.basename(chosen.replace("\\", "/")).lstrip(".") or f"{self.share.id}.bin"
         path = os.path.join(os.path.expanduser(directory), safe)
         with open(path, "wb") as handle:

@@ -131,6 +131,18 @@ def parse_link(link: str) -> ParsedLink:
     origin = origin_of(text)
     key = _key_from_fragment(parts.fragment)
 
+    # AN ABSOLUTE LINK WHOSE ORIGIN WE CANNOT REBUILD IS REFUSED, not quietly turned
+    # into a bare reference. "https:///s/ABCD1234" and "http://localhost:bad/..." both
+    # gave origin="" while the share path still parsed — and an empty origin is
+    # indistinguishable from "they typed just the id", so _client_for fell back to the
+    # DEFAULT MARKET. A typo in a self-hosted link sent the lookup to production.
+    if not origin:
+        raise ConfigurationError(
+            "that link has a scheme but no address we can use — check the host and "
+            "port. It is not repeated here, in case any part of it is a key. A bare "
+            "share id is accepted on its own if that is what you meant."
+        )
+
     path = parts.path.strip("/")
     if path.startswith("s/"):
         candidate = path[2:]
@@ -186,8 +198,21 @@ def build_link(origin: str, reference: str, key: str | bytes) -> str:
             "belongs only after '#k='. A share id is "
             f"{SHARE_ID.pattern} and a named link is {SHARE_NAME.pattern}."
         )
+    # AND THE ORIGIN, for the same reason and by the same rule. I fixed `reference`
+    # last round and left this — the other half of everything before the '#'. A key
+    # as the origin puts it in the link; "https://<key>.example" is worse, because it
+    # looks valid and sends the key through DNS and the request authority on the first
+    # click. Rebuilt through origin_of, which refuses a host carrying key material and
+    # is the one place that knows where an origin ends.
+    canonical = origin_of(origin)
+    if not canonical:
+        raise ConfigurationError(
+            "that origin is not one we can build a link from. Give a market's front "
+            "door — https://sikkerfil.no, sakerfil.se, sikkerfil.dk — or your own "
+            "host. It is not repeated here, in case it carries a key."
+        )
     path = f"s/{reference}" if SHARE_ID.match(reference) else reference
-    return f"{origin.rstrip('/')}/{path}#k={key_text(key)}"
+    return f"{canonical}/{path}#k={key_text(key)}"
 
 
 def base_url_for(market: str) -> str:
