@@ -81,8 +81,9 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
     THE SAME KEY HAS THREE SPELLINGS and callers hold whichever one they were
     handed. ``new_key()`` and ``Sealed.key`` are raw bytes; ``Sealed.key_text``
     and a link fragment are base64url text; a key read back out of a config file
-    or a shell variable may have kept its ``=`` padding, or a newline. They are
-    one key, and anything comparing or publishing them must agree on that.
+    or a shell variable may have kept its ``=`` padding, or a newline, or a line
+    wrap. They are one key, and anything comparing or publishing them must agree
+    on that.
 
     WHAT GOES WRONG WITHOUT THIS IS NOT A CRASH. Interpolate the bytes you have
     into a link and you get ``#k=b'\\x9c\\x1f...'`` — plausible length, opens for
@@ -100,13 +101,19 @@ def key_text(key: str | bytes | bytearray | memoryview) -> str:
     if isinstance(key, (bytes, bytearray, memoryview)):
         raw = bytes(key)
     else:
-        # STRIPPED FIRST, and this is not cosmetic. base64 decoding DISCARDS
-        # whitespace but COUNTS it when checking padding, so whether a stray
-        # newline broke a key depended on how many whitespace characters there
-        # were, modulo four: "key\n" was refused while "  key  " sailed through.
-        # receive() used to .strip() before this moved here; it belongs here.
+        # ALL WHITESPACE GOES, not just the ends, and this is not cosmetic.
+        # base64 decoding DISCARDS whitespace but COUNTS it when checking
+        # padding, so whether a stray character broke a key came down to how
+        # many of them there were, modulo four. With .strip() alone, a key
+        # WRAPPED ACROSS TWO LINES — an ordinary thing in a config file or an
+        # email — was refused, while one with a space every fourth character was
+        # accepted. Same key, same code.
+        #
+        # This cannot turn an invalid value into a valid one: 32 bytes needs 43
+        # base64 characters, so a key with a character missing is still short and
+        # the length check below still refuses it. Verified, not assumed.
         try:
-            raw = b64url_decode(key.strip())
+            raw = b64url_decode("".join(key.split()))
         # Both spellings of "not base64url" land here: binascii.Error for bad
         # characters and UnicodeEncodeError for non-ASCII are each a ValueError.
         except (TypeError, ValueError):

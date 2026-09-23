@@ -167,6 +167,10 @@ def test_any_bytes_like_spelling_of_the_key_normalises() -> None:
         "  " + KEY + "  ",
         "\t" + KEY + "\n",
         KEY + "=\n",  # padded AND newlined, from a config file
+        KEY[:20] + "\n" + KEY[20:],  # WRAPPED, as a config file or an email does
+        KEY[:20] + " " + KEY[20:],
+        " ".join(KEY[i : i + 4] for i in range(0, len(KEY), 4)),  # grouped for reading
+        " ".join(KEY),  # every character separated — absurd, but it IS the key
     ],
 )
 def test_whitespace_around_a_key_does_not_break_it(spelling: str) -> None:
@@ -178,6 +182,10 @@ def test_whitespace_around_a_key_does_not_break_it(spelling: str) -> None:
     needed, and the 43 real characters were then rejected as badly padded —
     while two spaces either side made 47, one '=' was added, and it sailed
     through. A key surviving a copy-paste must not be a coin flip.
+
+    Which is why ALL whitespace goes, not just the ends: with .strip() alone, a
+    key wrapped across two lines was still refused while one with a space every
+    fourth character was accepted. Same key, same code.
     """
     assert crypto.key_text(spelling) == KEY
 
@@ -188,3 +196,25 @@ def test_a_key_with_a_newline_still_builds_a_clean_link() -> None:
     assert build_link("https://sikkerfil.no", "ABCD1234", KEY + "\n") == (
         f"https://sikkerfil.no/s/ABCD1234#k={KEY}"
     )
+
+
+@pytest.mark.parametrize(
+    "not_a_key",
+    [
+        KEY[:20] + " " + KEY[21:],  # a character REPLACED by a space
+        KEY[:20] + KEY[21:],  # a character dropped
+        KEY + KEY,  # two keys, pasted twice
+        KEY[:-1] + " ",  # the LAST character replaced by a space
+    ],
+)
+def test_removing_whitespace_cannot_manufacture_a_valid_key(not_a_key: str) -> None:
+    """The permissiveness above must not become a way in.
+
+    32 bytes needs 43 base64 characters, so a key with one missing is still short
+    after the whitespace goes and the length check refuses it. That is the
+    backstop, and this asserts it rather than trusting the reasoning — the last
+    character of a key being replaced by a space is the near miss that matters,
+    because the result is the right LENGTH before decoding.
+    """
+    with pytest.raises(ConfigurationError):
+        crypto.key_text(not_a_key)
