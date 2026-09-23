@@ -415,12 +415,29 @@ def renders_key_bytes(value: str) -> bool:
     # machine are 40 characters end to end (0.085%). The cost that is not measurable
     # is a caller whose PASSWORD is forty characters of that alphabet; they are
     # refused, by name, with a message that says what to change.
+    # a85encode(adobe=True) wraps its output in <~ ~> and needs the same flag back;
+    # the plain decoder refuses it, and the punctuation keeps the run fallback from
+    # seeing anything either. Another member of "the set the standard library
+    # produces" that I enumerated without consulting the library.
+    #
+    # INLINE, NOT A NAMED HELPER, and the sweep is why. My first version put the
+    # adobe attempt behind a module-level function, which the exhaustive sweep then
+    # called with a fullwidth key and caught red-handed: a85decode raises
+    # ValueError("Ascii85 encoded byte sequences must end with b'~>'") for some
+    # inputs and echoes the value for others, and a public-shaped function that
+    # forwards a caller's value to a raising stdlib call is exactly what this branch
+    # is about. Nothing here is reachable by name any more.
     for decode in (base64.a85decode, base64.b85decode):
         try:
             if len(decode(compact)) == KEY_BYTES:
                 return True
         except (ValueError, TypeError):
             continue
+    try:
+        if len(base64.a85decode(compact, adobe=True)) == KEY_BYTES:
+            return True
+    except (ValueError, TypeError):
+        pass
 
     return False
 

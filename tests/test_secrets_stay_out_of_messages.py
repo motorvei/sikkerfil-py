@@ -1296,6 +1296,7 @@ def _every_rendering_the_standard_library_makes(raw: bytes) -> dict[str, str]:
         "hex with colons": raw.hex(":"),
         "hex with dashes": raw.hex("-"),
         "repr": repr(raw),
+        "a85encode adobe": base64.a85encode(raw, adobe=True).decode(),
     }
 
 

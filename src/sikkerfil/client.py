@@ -550,11 +550,19 @@ def _read_source(source: Source) -> tuple[bytes, str | None]:
     raise ConfigurationError(f"cannot send a {type(source).__name__}; pass a path, bytes or a file")
 
 
-#: A media type, by RFC 6838: a restricted name, a slash, a restricted name. Used
-#: instead of a run threshold for content_type, which is a registered token and not
-#: a caller's invention.
+#: A media type, by RFC 6838 and RFC 9110: a restricted name, a slash, a restricted
+#: name, and then any number of ``; name=value`` parameters. Used instead of a run
+#: threshold for content_type, whose contents are a registered token and not a
+#: caller's invention.
+#:
+#: THE PARAMETERS ARE NOT DECORATION. "text/plain; charset=utf-8" is an ordinary
+#: Content-Type and my first version of this refused it — a regression I introduced
+#: while fixing a different over-refusal, in the same parameter, one round apart.
 _MEDIA_TOKEN = r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}"
-_MEDIA_TYPE = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}")
+_PARAMETER_TOKEN = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
+_QUOTED_STRING = r'"(?:[^"\\]|\\.)*"'
+_PARAMETER = rf";[ \t]*{_PARAMETER_TOKEN}=(?:{_PARAMETER_TOKEN}|{_QUOTED_STRING})"
+_MEDIA_TYPE = re.compile(rf"{_MEDIA_TOKEN}/{_MEDIA_TOKEN}(?:[ \t]*{_PARAMETER})*[ \t]*")
 
 
 def _is_a_content_type(value: str) -> bool:
@@ -569,7 +577,20 @@ def _is_a_content_type(value: str) -> bool:
     """
     if not _MEDIA_TYPE.fullmatch(value) or links.renders_key_bytes(value):
         return False
-    return not links.renders_key_bytes(value.replace("/", ""))
+    if links.renders_key_bytes(value.replace("/", "")):
+        return False
+    # AND EVERY PARAMETER VALUE ON ITS OWN. Allowing parameters opens a place to put
+    # a key that none of the questions above reach: "text/plain; charset=<a key>" is
+    # a perfectly good media type by the grammar, and the whole string is not a
+    # rendering of anything. Nobody reported this one — it arrived with the fix for
+    # the parameters, which is the shape of mistake this branch keeps making.
+    head, _, parameters = value.partition(";")
+    for parameter in parameters.split(";"):
+        _, _, given = parameter.partition("=")
+        candidate = given.strip().strip('"')
+        if candidate and links.opaque_carries_key_material(candidate):
+            return False
+    return not links.renders_key_bytes(head.replace("/", ""))
 
 
 def _nothing_here_is_a_key(

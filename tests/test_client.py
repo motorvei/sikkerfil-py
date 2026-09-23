@@ -11,6 +11,7 @@ that must not be in it.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 from typing import Any
@@ -592,3 +593,36 @@ def test_a_long_registered_content_type_reaches_the_service(client: Sikkerfil, s
     for shaped in (f"{key[:20]}/{key[20:]}", key, "A" * 20 + "/" + "A" * 22):
         with pytest.raises(ConfigurationError):
             client.send(PLAINTEXT, content_type=shaped)
+
+
+def test_a_parameterised_content_type_reaches_the_service(client: Sikkerfil, stub) -> None:
+    """``text/plain; charset=utf-8`` is an ordinary Content-Type.
+
+    My first version of the media-type grammar took only the bare type/subtype, so
+    fixing one over-refusal in this parameter introduced another one round later.
+
+    And allowing parameters opens a place to put a key that none of the other
+    questions reach — "text/plain; charset=<a key>" is a valid media type and is not
+    a rendering of anything as a whole string — so each parameter value is asked
+    about on its own. Nobody reported that; it arrived with the fix.
+    """
+    for accepted in (
+        "text/plain; charset=utf-8",
+        "text/plain;charset=utf-8",
+        'text/csv; charset="utf-8"',
+        "multipart/form-data; boundary=----abc",
+    ):
+        client.send(PLAINTEXT, content_type=accepted)
+        assert json.loads(stub.requests[-3].body)["contentType"] == accepted
+
+    key = crypto.b64url_encode(bytes(range(32)))
+    before = len(stub.requests)
+    for refused in (
+        f"text/plain; charset={key}",
+        f'text/plain; charset="{key}"',
+        f"text/plain; charset={base64.b85encode(bytes(range(32))).decode()}",
+        "text/plain; charset",
+    ):
+        with pytest.raises(ConfigurationError):
+            client.send(PLAINTEXT, content_type=refused)
+    assert len(stub.requests) == before
