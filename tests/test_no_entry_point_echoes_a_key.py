@@ -31,6 +31,7 @@ import contextlib
 import functools
 import inspect as pyinspect
 import io
+import pathlib
 import typing
 import urllib.error
 import urllib.request
@@ -84,7 +85,9 @@ _PLAUSIBLE = {
     "api_key": "sikkerfil_sk_" + "x" * 43,
     "filename": "rapport.pdf",
     "content_type": "application/pdf",
-    "directory": ".",
+    # NOT "." — see _sealed_off. The sweep hands a key to this parameter, and a
+    # relative directory means the working tree.
+    "directory": "written-here",
 }
 
 
@@ -279,14 +282,23 @@ def _string_parameters(fn: Any) -> tuple[list[str], bool]:
 
 
 @pytest.fixture(autouse=True)
-def _no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Every outbound request becomes a failure, not a quietly-counted refusal.
+def _sealed_off(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> list[str]:
+    """No network, and no writing into the working tree.
 
-    A sweep that reaches the network is measuring somebody else's uptime. Worse,
-    the exception it gets back is a transport error that happens to contain no key,
-    so the case PASSES and looks covered. Recording the attempts lets the test
-    assert it stayed local instead of assuming it.
+    A sweep that reaches the network is measuring somebody else's uptime. Worse, the
+    exception it gets back is a transport error that happens to contain no key, so
+    the case PASSES and looks covered. Recording the attempts lets the test assert
+    it stayed local rather than assume it.
+
+    AND IT RUNS IN A TEMPORARY DIRECTORY, because handing a key to every string
+    parameter includes the ones that name a file. ``ReceivedFile.save`` took the
+    plausible directory ".", so while the guard on key-shaped filenames was reverted
+    to check it, the sweep wrote EIGHT FILES NAMED AFTER KEYS into the repository
+    root — one of them with a newline in its name. A test that leaves secrets on
+    disk where they can be committed is the bug this whole file is about, committed
+    by the file itself.
     """
+    monkeypatch.chdir(tmp_path)
     # THE MODULE-LEVEL receive()/inspect() BUILD THEIR OWN CLIENT from the link's
     # origin, so pointing the Sikkerfil instance at the discard port fixed only half
     # of it — a bare id or key falls back to the default market, which is
@@ -307,7 +319,7 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 @pytest.mark.parametrize("spelling", list(KEYS), ids=list(KEYS))
 def test_no_public_entry_point_echoes_a_key_it_was_handed(
-    spelling: str, _no_network: list[str]
+    spelling: str, _sealed_off: list[str]
 ) -> None:
     handed = KEYS[spelling]
     # Always hunt for the REAL key, whatever variant went in.
@@ -433,7 +445,7 @@ def test_no_public_entry_point_echoes_a_key_it_was_handed(
 
     # Said out loud, because "it did not leak" is worth nothing if the call never
     # ran the code under test and merely failed to resolve a hostname.
-    outside = [u for u in _no_network if "127.0.0.1:9" not in u]
+    outside = [u for u in _sealed_off if "127.0.0.1:9" not in u]
     assert not outside, "the sweep tried to leave the machine:\n  " + "\n  ".join(
         sorted(set(outside))
     )
